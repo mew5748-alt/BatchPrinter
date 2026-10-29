@@ -4,14 +4,17 @@ printer_core.py - 批量打印核心引擎
 支持引擎:
   1. GDI 直印 (文本/图片): 完全控制份数/色彩/双面/页码范围
   2. SumatraPDF (PDF):    命令行完整控制
-  3. Shell 打印动词 (Office 等关联程序): 通过临时修改打印机默认 DEVMODE 控制份数/色彩/双面
-  4. RAW 直写 (prn/ps/pcl): 字节流直送打印机
+  3. Office COM (Word/Excel/PPT): 改版面 -> 转 PDF -> 走 PDF 通道, 全程静默
+  4. Shell 打印动词 (其他未知格式): 临时切默认打印机 + printto
+  5. RAW 直写 (prn/ps/pcl): 字节流直送打印机
 """
 
 import os
 import time
 import glob
 import shutil
+import subprocess
+import contextlib
 import threading
 
 import win32print
@@ -20,6 +23,9 @@ import win32con
 import win32gui
 import win32ui
 from PIL import Image, ImageWin
+
+import office_core
+from office_core import OfficeUnavailable
 
 # ---------------------------------------------------------------- 常量
 
@@ -44,7 +50,9 @@ ARCHIVE_EXTS = {".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz"}
 
 # DEVMODE 常量
 DM_ORIENTATION = 0x00000001
+DM_PAPERSIZE = 0x00000002
 DM_COPIES = 0x00000100
+DM_DEFAULTSOURCE = 0x00000200
 DM_DUPLEX = 0x00001000
 DM_COLOR = 0x00000800
 DM_COLLATE = 0x00008000
@@ -55,6 +63,13 @@ DMDUP_SIMPLEX = 1
 DMDUP_VERTICAL = 2      # 长边翻页
 DMDUP_HORIZONTAL = 3    # 短边翻页
 DMCOLLATE_TRUE = 1
+
+# DeviceCapabilities 能力号 (注意 DC_BINS 是 6, 不是 5)
+DC_PAPERS = 2
+DC_PAPERSIZE = 3
+DC_BINS = 6
+DC_BINNAMES = 12
+DC_PAPERNAMES = 16
 
 # 设置值 -> DEVMODE
 COLOR_MAP = {"mono": DMCOLOR_MONOCHROME, "color": DMCOLOR_COLOR}
@@ -141,7 +156,96 @@ class PrinterSettingsError(Exception):
     pass
 
 
-def _modify_devmode(dm, copies=None, color=None, duplex=None, collate=None):
+# ---------------------------------------------------------------- 纸型 / 纸张来源
+
+def printer_port(printer_name):
+    """打印机端口名 (DeviceCapabilities 需要 device + port 两个参数)"""
+    try:
+        h = win32print.OpenPrinter(printer_name)
+        try:
+            return win32print.GetPrinter(h, 2).get("pPortName", "") or ""
+        finally:
+            win32print.ClosePrinter(h)
+    except Exception:
+        return ""
+
+
+def _capabilities(printer_name, cap):
+    """DeviceCapabilities 的安全包装: 失败一律返回空元组"""
+    try:
+        port = printer_port(printer_name)
+        return win32print.DeviceCapabilities(printer_name, port, cap) or ()
+    except Exception:
+        return ()
+
+
+def _point_mm(p):
+    """DC_PAPERSIZE 的 POINT(0.1mm) -> (宽mm, 高mm); 兼容 dict / tuple"""
+    try:
+        if isinstance(p, dict):
+            w, h = int(p.get("x") or 0), int(p.get("y") or 0)
+        else:
+            w, h = int(p[0]), int(p[1])
+        return int(round(w / 10.0)), int(round(h / 10.0))
+    except Exception:
+        return 0, 0
+
+
+def list_paper_sizes(printer_name):
+    """打印机支持的纸型: [(纸型ID, 名称, 宽mm, 高mm), ...]
+
+    名称直接取驱动自带的名字 ("A4(210x297mm)" / "信纸")，中文系统下就是用户
+    在打印机驱动里看到的那套叫法。
+    """
+    if not printer_name:
+        return []
+    ids = _capabilities(printer_name, DC_PAPERS)
+    names = _capabilities(printer_name, DC_PAPERNAMES)
+    sizes = _capabilities(printer_name, DC_PAPERSIZE)
+    out, seen = [], set()
+    for i, pid in enumerate(ids):
+        try:
+            pid = int(pid)
+        except Exception:
+            continue
+        if pid in seen or pid <= 0:
+            continue
+        seen.add(pid)
+        name = str(names[i]).strip() if i < len(names) else ""
+        w, h = _point_mm(sizes[i]) if i < len(sizes) else (0, 0)
+        out.append((pid, name or ("纸型 %d" % pid), w, h))
+    return out
+
+
+def list_paper_bins(printer_name):
+    """打印机纸盒 / 纸张来源: [(来源ID, 名称), ...]"""
+    if not printer_name:
+        return []
+    ids = _capabilities(printer_name, DC_BINS)
+    names = _capabilities(printer_name, DC_BINNAMES)
+    out, seen = [], set()
+    for i, bid in enumerate(ids):
+        try:
+            bid = int(bid)
+        except Exception:
+            continue
+        if bid in seen:
+            continue
+        seen.add(bid)
+        name = str(names[i]).strip() if i < len(names) else ""
+        out.append((bid, name or ("纸盒 %d" % bid)))
+    return out
+
+
+def _paper_size_to_int(v):
+    try:
+        return int(v) if v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _modify_devmode(dm, copies=None, color=None, duplex=None, collate=None,
+                    paper_size=None, paper_source=None):
     """在 PyDEVMODE 上应用设置并置位对应 Fields"""
     fields = 0
     if copies is not None and copies > 0:
@@ -156,19 +260,28 @@ def _modify_devmode(dm, copies=None, color=None, duplex=None, collate=None):
     if duplex is not None:
         dm.Duplex = duplex
         fields |= DM_DUPLEX
+    if paper_size:
+        dm.PaperSize = int(paper_size)
+        fields |= DM_PAPERSIZE
+    if paper_source:
+        dm.DefaultSource = int(paper_source)
+        fields |= DM_DEFAULTSOURCE
     if fields:
         dm.Fields |= fields
     return dm
 
 
-def apply_printer_defaults(printer_name, copies=None, color=None, duplex=None):
+def apply_printer_defaults(printer_name, copies=None, color=None, duplex=None,
+                           paper_size=None, paper_source=None):
     """临时把设置写入打印机默认 DEVMODE, 返回恢复句柄 (传给 restore_printer_defaults)"""
     h = win32print.OpenPrinter(printer_name, {"DesiredAccess": win32print.PRINTER_ALL_ACCESS})
     try:
         info = win32print.GetPrinter(h, 2)
         original = info["pDevMode"]
         dm = info["pDevMode"]
-        _modify_devmode(dm, copies=copies, color=color, duplex=duplex, collate=(copies or 0) > 1)
+        _modify_devmode(dm, copies=copies, color=color, duplex=duplex,
+                        collate=(copies or 0) > 1,
+                        paper_size=paper_size, paper_source=paper_source)
         info["pDevMode"] = dm
         win32print.SetPrinter(h, 2, info, 0)
         return h, original
@@ -178,6 +291,29 @@ def apply_printer_defaults(printer_name, copies=None, color=None, duplex=None):
         except Exception:
             pass
         raise PrinterSettingsError(str(e))
+
+
+@contextlib.contextmanager
+def temp_printer_defaults(printer_name, log=None, settle=0.8, **kw):
+    """临时改打印机默认的纸型/纸盒, 退出时恢复 (给 Sumatra / Shell 通道用)
+
+    这两个通道自己创建 DC 时读的是打印机默认 DEVMODE, 拿不到我们传入的
+    devmode, 所以只能临时改默认值再改回来。
+    """
+    ctx = None
+    if any(kw.get(k) for k in ("paper_size", "paper_source")):
+        try:
+            ctx = apply_printer_defaults(printer_name, **kw)
+        except PrinterSettingsError as e:
+            if log:
+                log(f"提示: 无法临时应用纸型/进纸盒 ({e}), 将按打印机当前默认值打印")
+    try:
+        yield
+    finally:
+        if ctx:
+            time.sleep(settle)          # 等驱动把作业读走再恢复
+            restore_printer_defaults(*ctx)
+
 
 
 def restore_printer_defaults(h, original):
@@ -258,23 +394,98 @@ class default_printer_guard:
 
 # ---------------------------------------------------------------- GDI 直印 (文本/图片)
 
-def _open_printer_dc(printer_name, copies=None, color=None, duplex=None):
+def _open_printer_dc(printer_name, copies=None, color=None, duplex=None,
+                     paper_size=None, paper_source=None):
     hprinter = win32print.OpenPrinter(printer_name)
     dm = win32print.GetPrinter(hprinter, 2)["pDevMode"]
     win32print.ClosePrinter(hprinter)
-    _modify_devmode(dm, copies=copies, color=color, duplex=duplex, collate=(copies or 0) > 1)
+    _modify_devmode(dm, copies=copies, color=color, duplex=duplex,
+                    collate=(copies or 0) > 1,
+                    paper_size=paper_size, paper_source=paper_source)
     hdc = win32gui.CreateDC("WINSPOOL", printer_name, dm)
     return win32ui.CreateDCFromHandle(hdc)
 
 
-def print_text_gdi(path, printer_name, copies, color, duplex, page_set, log):
-    """文本文件 GDI 直印, 支持页码范围"""
+def dc_paper_mm(dc):
+    """DC 上驱动实际回报的纸张尺寸 (毫米), 用来确认纸型真的生效了"""
+    try:
+        lpx = dc.GetDeviceCaps(win32con.LOGPIXELSX) or 600
+        w = dc.GetDeviceCaps(win32con.PHYSICALWIDTH)
+        h = dc.GetDeviceCaps(win32con.PHYSICALHEIGHT)
+        return int(round(w * 25.4 / lpx)), int(round(h * 25.4 / lpx))
+    except Exception:
+        return 0, 0
+
+
+def plan_pages(count, page_set):
+    """要打印的页码列表 (1..count 有序, 按页码范围过滤; 空列表表示都不用打)"""
+    if count <= 0:
+        return []
+    if page_set is None:
+        return list(range(1, count + 1))
+    return [p for p in range(1, count + 1) if p in page_set]
+
+
+def _pages_desc(pages, total):
+    """日志用: 只打了部分页面时列出页码"""
+    if not pages or len(pages) == total:
+        return ""
+    txt = ",".join(str(p) for p in pages[:20])
+    return " (第%s页%s)" % (txt, "…" if len(pages) > 20 else "")
+
+
+class _DocWriter:
+    """管理 StartDoc/EndDoc 的生命周期
+
+    普通模式: 整个文件一个打印作业; 逐页模式: 每页一个独立作业 (作业名带页码),
+    页与页之间可停一会儿——卡纸/漏页时容易从任意一页补打, 手动放纸也能一页一页来。
+    """
+
+    def __init__(self, dc, base, per_page=False, gap=0.0):
+        self.dc = dc
+        self.base = base
+        self.per_page = bool(per_page)
+        try:
+            self.gap = max(0.0, float(gap or 0))
+        except (TypeError, ValueError):
+            self.gap = 0.0
+        self.open = False
+
+    def begin(self, page_no):
+        if self.per_page:
+            self.dc.StartDoc("%s - 第%d页" % (self.base, page_no))
+            self.open = True
+        elif not self.open:
+            self.dc.StartDoc(self.base)
+            self.open = True
+
+    def end(self, last=False):
+        self.dc.EndPage()
+        if self.per_page:
+            self.dc.EndDoc()
+            self.open = False
+            if not last and self.gap:
+                time.sleep(self.gap)
+
+    def close(self):
+        if self.open:
+            try:
+                self.dc.EndDoc()
+            except Exception:
+                pass
+            self.open = False
+
+
+def print_text_gdi(path, printer_name, copies, color, duplex, page_set, log,
+                   paper_size=None, paper_source=None, per_page=False, page_gap=0.0):
+    """文本文件 GDI 直印, 支持页码范围 / 逐页打印"""
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         lines = f.read().replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
-    dc = _open_printer_dc(printer_name, copies=copies, color=color, duplex=duplex)
+    base = os.path.basename(path)
+    dc = _open_printer_dc(printer_name, copies=copies, color=color, duplex=duplex,
+                          paper_size=paper_size, paper_source=paper_source)
     try:
-        dc.StartDoc(os.path.basename(path))
         font = win32ui.CreateFont({"name": "Consolas", "height": -110, "weight": 400})
         dc.SelectObject(font)
         lh = dc.GetTextExtent("Ag")[1] + 6
@@ -286,55 +497,58 @@ def print_text_gdi(path, printer_name, copies, color, duplex, page_set, log):
             pass
 
         page_h = dc.GetDeviceCaps(win32con.VERTRES)
-        per_page = max(1, (page_h - margin_x * 2) // lh)
-
-        page_no = 0
-        cur_line = 0
+        per = max(1, (page_h - margin_x * 2) // lh)     # 每页能排多少行
         total = len(lines)
-        while cur_line < total:
-            if page_set is None or (page_no + 1) in page_set:
-                dc.StartPage()
-                y = margin_x
-                for _ in range(per_page):
-                    if cur_line >= total:
-                        break
-                    dc.TextOut(margin_x, y, lines[cur_line][:180])
-                    y += lh
-                    cur_line += 1
-                dc.EndPage()
-            else:
-                cur_line += per_page  # 该页不在页码范围内, 整页跳过
-            page_no += 1
-        dc.EndDoc()
+        if total <= 0:
+            log(f"跳过 {base}: 文件内容为空")
+            return
+        page_count = (total + per - 1) // per
+        todo = plan_pages(page_count, page_set)
+        if not todo:
+            log(f"跳过 {base}: 页码范围不包含任何页")
+            return
+
+        writer = _DocWriter(dc, base, per_page, page_gap)
+        for k, pno in enumerate(todo):
+            chunk = lines[(pno - 1) * per: pno * per]
+            writer.begin(pno)
+            dc.StartPage()
+            y = margin_x
+            for line in chunk:
+                dc.TextOut(margin_x, y, line[:180])
+                y += lh
+            writer.end(last=(k == len(todo) - 1))
+        writer.close()
     finally:
         dc.DeleteDC()
-    log(f"GDI 文本打印完成: {os.path.basename(path)}")
+    log(f"GDI 文本打印完成: {base}" + _pages_desc(todo, page_count))
 
 
-def print_image_gdi(path, printer_name, copies, color, duplex, page_set, log):
-    """图片 GDI 直印 (等比缩放居中), 支持页码范围 (多帧 tif/tiff 按页处理)"""
+def print_image_gdi(path, printer_name, copies, color, duplex, page_set, log,
+                    paper_size=None, paper_source=None, per_page=False, page_gap=0.0):
+    """图片 GDI 直印 (等比缩放居中), 多帧 tif/tiff 按页处理"""
     img = Image.open(path)
     frames = []
+    need = max(page_set) if page_set else 0      # 只读需要的那几帧, 避免大 TIFF 撑爆内存
     try:
         n = getattr(img, "n_frames", 1)
         for i in range(n):
             img.seek(i)
-            fr = img.convert("RGB")
-            frames.append(fr.copy())
-            if page_set is not None and len(frames) > max(page_set):
+            frames.append(img.convert("RGB").copy())
+            if need and len(frames) >= need:
                 break
     except Exception:
         frames = [img.convert("RGB")]
 
-    if page_set is not None:
-        frames = [fr for idx, fr in enumerate(frames, 1) if idx in page_set]
-        if not frames:
-            log(f"跳过 {os.path.basename(path)}: 页码范围不包含任何页")
-            return
+    base = os.path.basename(path)
+    todo = plan_pages(len(frames), page_set)
+    if not todo:
+        log(f"跳过 {base}: 页码范围不包含任何页")
+        return
 
-    dc = _open_printer_dc(printer_name, copies=copies, color=color, duplex=duplex)
+    dc = _open_printer_dc(printer_name, copies=copies, color=color, duplex=duplex,
+                          paper_size=paper_size, paper_source=paper_source)
     try:
-        dc.StartDoc(os.path.basename(path))
         pw, ph = dc.GetDeviceCaps(win32con.HORZRES), dc.GetDeviceCaps(win32con.VERTRES)
         try:
             lpx = dc.GetDeviceCaps(win32con.LOGPIXELSX)
@@ -343,46 +557,49 @@ def print_image_gdi(path, printer_name, copies, color, duplex, page_set, log):
             m = 30
         pw, ph = pw - m * 2, ph - m * 2
 
-        for fr in frames:
+        writer = _DocWriter(dc, base, per_page, page_gap)
+        for k, pno in enumerate(todo):
+            writer.begin(pno)
             dc.StartPage()
-            dib = ImageWin.Dib(fr)
+            dib = ImageWin.Dib(frames[pno - 1])
             iw, ih = dib.size
             scale = min(pw / iw, ph / ih)
             w, h = int(iw * scale), int(ih * scale)
             x0 = m + (pw - w) // 2
             y0 = m + (ph - h) // 2
             dib.draw(dc.GetHandleOutput(), (x0, y0, x0 + w, y0 + h))
-            dc.EndPage()
-        dc.EndDoc()
+            writer.end(last=(k == len(todo) - 1))
+        writer.close()
     finally:
         dc.DeleteDC()
-    log(f"GDI 图片打印完成: {os.path.basename(path)}")
+    log(f"GDI 图片打印完成: {base}" + _pages_desc(todo, len(frames)))
 
 
 # ---------------------------------------------------------------- PDF GDI 直印 (pypdfium2 渲染)
 
-def print_pdf_gdi(path, printer_name, copies, color, duplex, page_set, log, dpi=200):
-    """用 pypdfium2 渲染 PDF 后经 GDI 直印, 完整支持份数/色彩/双面/页码范围"""
+def print_pdf_gdi(path, printer_name, copies, color, duplex, page_set, log, dpi=200,
+                  paper_size=None, paper_source=None, per_page=False, page_gap=0.0):
+    """用 pypdfium2 渲染 PDF 后经 GDI 直印, 完整支持份数/色彩/双面/页码/逐页"""
     try:
         import pypdfium2 as pdfium
     except ImportError:
         raise RuntimeError("PDF 引擎不可用: 请安装 pypdfium2 (pip install pypdfium2) 或 SumatraPDF")
 
+    base = os.path.basename(path)
     try:
         pdf = pdfium.PdfDocument(path)
     except Exception as e:
         raise RuntimeError(f"PDF 打开失败: {e}")
     try:
         n = len(pdf)
-        idxs = sorted(page_set) if page_set is not None else list(range(1, n + 1))
-        idxs = [i for i in idxs if 1 <= i <= n]
-        if not idxs:
-            log(f"跳过 {os.path.basename(path)}: 页码范围不包含任何页")
+        todo = plan_pages(n, page_set)
+        if not todo:
+            log(f"跳过 {base}: 页码范围不包含任何页")
             return
 
-        dc = _open_printer_dc(printer_name, copies=copies, color=color, duplex=duplex)
+        dc = _open_printer_dc(printer_name, copies=copies, color=color, duplex=duplex,
+                              paper_size=paper_size, paper_source=paper_source)
         try:
-            dc.StartDoc(os.path.basename(path))
             pw, ph = dc.GetDeviceCaps(win32con.HORZRES), dc.GetDeviceCaps(win32con.VERTRES)
             try:
                 lpx = dc.GetDeviceCaps(win32con.LOGPIXELSX)
@@ -391,11 +608,13 @@ def print_pdf_gdi(path, printer_name, copies, color, duplex, page_set, log, dpi=
                 m = 25
             pw, ph = pw - m * 2, ph - m * 2
 
-            for i in idxs:
-                page = pdf[i - 1]
+            writer = _DocWriter(dc, base, per_page, page_gap)
+            for k, pno in enumerate(todo):
+                page = pdf[pno - 1]
                 scale = dpi / 72.0
                 pil = page.render(scale=scale).to_pil().convert("RGB")
                 page.close()
+                writer.begin(pno)
                 dc.StartPage()
                 dib = ImageWin.Dib(pil)
                 iw, ih = dib.size
@@ -404,8 +623,8 @@ def print_pdf_gdi(path, printer_name, copies, color, duplex, page_set, log, dpi=
                 x0 = m + (pw - w) // 2
                 y0 = m + (ph - h) // 2
                 dib.draw(dc.GetHandleOutput(), (x0, y0, x0 + w, y0 + h))
-                dc.EndPage()
-            dc.EndDoc()
+                writer.end(last=(k == len(todo) - 1))
+            writer.close()
         finally:
             dc.DeleteDC()
     finally:
@@ -413,8 +632,8 @@ def print_pdf_gdi(path, printer_name, copies, color, duplex, page_set, log, dpi=
             pdf.close()
         except Exception:
             pass
-    log(f"PDF 直印完成 (内置引擎): {os.path.basename(path)}"
-        + (f" 第{','.join(map(str, idxs))}页" if page_set is not None else ""))
+    log(f"PDF 直印完成 (内置引擎): {base}" + _pages_desc(todo, n))
+
 
 
 # ---------------------------------------------------------------- RAW 直写
@@ -495,7 +714,8 @@ def shell_print(path, printer_name="", log=None):
 
 # ---------------------------------------------------------------- SumatraPDF
 
-def print_pdf_sumatra(sumatra_exe, path, printer_name, copies, color, duplex, page_set, log):
+def print_pdf_sumatra(sumatra_exe, path, printer_name, copies, color, duplex, page_set, log,
+                      paper_size=None, paper_source=None):
     settings = []
     if copies and copies > 1:
         settings.append(f"{copies}x")
@@ -510,27 +730,35 @@ def print_pdf_sumatra(sumatra_exe, path, printer_name, copies, color, duplex, pa
     elif color == DMCOLOR_COLOR:
         settings.append("color")
     if page_set:
-        rng = []
-        pages = sorted(page_set)
-        start = prev = pages[0]
-        for p in pages[1:]:
-            if p == prev + 1:
-                prev = p
-                continue
-            rng.append(f"{start}-{prev}" if prev > start else f"{start}")
-            start = prev = p
-        rng.append(f"{start}-{prev}" if prev > start else f"{start}")
-        settings.append(",".join(rng))
+        settings.append(_range_text(page_set))
 
     cmd = [sumatra_exe, "-print-to", printer_name, "-silent"]
     if settings:
         cmd += ["-print-settings", ",".join(settings)]
     cmd.append(path)
-    proc = __import__("subprocess").run(cmd, capture_output=True, timeout=120)
+    # Sumatra 自己创建 DC, 拿不到我们传的 devmode; 纸型/进纸盒只能临时写进打印机默认值
+    with temp_printer_defaults(printer_name, log,
+                               paper_size=paper_size, paper_source=paper_source):
+        proc = subprocess.run(cmd, capture_output=True, timeout=120)
     if proc.returncode != 0:
         err = (proc.stderr or b"").decode("utf-8", "replace").strip()
         raise RuntimeError(f"SumatraPDF 打印失败: {err or proc.returncode}")
     log(f"SumatraPDF 打印已发送: {os.path.basename(path)}" + (f" (设置: {','.join(settings)})" if settings else ""))
+
+
+def _range_text(page_set):
+    """{1,2,3,5} -> '1-3,5'"""
+    rng = []
+    pages = sorted(page_set)
+    start = prev = pages[0]
+    for p in pages[1:]:
+        if p == prev + 1:
+            prev = p
+            continue
+        rng.append(f"{start}-{prev}" if prev > start else f"{start}")
+        start = prev = p
+    rng.append(f"{start}-{prev}" if prev > start else f"{start}")
+    return ",".join(rng)
 
 
 # ---------------------------------------------------------------- 统一打印入口
@@ -543,11 +771,70 @@ def settings_to_devmode_values(copies=None, color=None, duplex=None):
     return c, col, dup
 
 
+def to_float(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def paper_devmode_values(opts):
+    """opts 里的纸型/进纸盒 -> (dmPaperSize, dmDefaultSource); None = 跟随打印机"""
+    return _paper_size_to_int(opts.get("paper")), _paper_size_to_int(opts.get("source"))
+
+
+def _print_pdf_path(pdf, printer_name, copies, color, duplex, page_set, log, opts,
+                    sumatra_exe, dpi=200):
+    """PDF 统一通道: 有 Sumatra 且不逐页 -> Sumatra; 否则走内置渲染引擎"""
+    paper_size, paper_source = paper_devmode_values(opts)
+    per_page = bool(opts.get("per_page"))
+    gap = to_float(opts.get("page_gap"), 0.0)
+    if sumatra_exe and not per_page:
+        print_pdf_sumatra(sumatra_exe, pdf, printer_name, copies, color, duplex,
+                          page_set, log, paper_size=paper_size,
+                          paper_source=paper_source)
+        return
+    try:
+        import pypdfium2  # noqa: F401
+    except ImportError:
+        if sumatra_exe:
+            # 逐页打印只能靠内置引擎拆页; 没有它就按整份发一份, 不要因此打不出来
+            log("提示: 逐页打印需要内置 PDF 引擎, 本次按整份发送")
+            print_pdf_sumatra(sumatra_exe, pdf, printer_name, copies, color, duplex,
+                              page_set, log, paper_size=paper_size,
+                              paper_source=paper_source)
+            return
+        raise ImportError("PDF 引擎不可用: 请安装 pypdfium2 或 SumatraPDF")
+    print_pdf_gdi(pdf, printer_name, copies, color, duplex, page_set, log, dpi=dpi,
+                  paper_size=paper_size, paper_source=paper_source,
+                  per_page=per_page, page_gap=gap)
+
+
+def print_office_com(path, printer_name, copies, color, duplex, page_set,
+                     opts, sumatra_exe, log, kind=None):
+    """Office 文档: COM 改版面 -> 导出 PDF -> 走 PDF 通道静默打印.
+
+    这一步彻底摆脱了 Shell 的 print 动词: 不会弹程序窗口、不用切系统默认打印机,
+    并且能真正控制页边距/缩放 (Word 页边距、Excel 所有列缩到一页宽)。
+    """
+    layout = opts.get("layout")
+    pdf, work = office_core.export_pdf(path, layout, log, kind=kind)
+    try:
+        # Office 文档文字多, 用 300dpi 渲染, 比默认 200dpi 更清晰
+        _print_pdf_path(pdf, printer_name, copies, color, duplex, page_set, log,
+                        opts, sumatra_exe, dpi=300)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def print_file(path, printer_name, opts, ext_map, sumatra_exe, log):
     """
     打印单个文件.
-    opts: dict(copies=int|None, color='color'|'mono'|None, duplex='simplex'|'duplex_long'|'duplex_short'|None,
-               pages=str|None)
+    opts: dict(copies=int|None, color='color'|'mono'|None,
+               duplex='simplex'|'duplex_long'|'duplex_short'|None,
+               pages=str|None, layout=dict|None, office_com=bool,
+               paper=int|None 纸型ID(按纸型缩放), source=int|None 进纸盒ID,
+               per_page=bool 逐页打印, page_gap=float 页间间隔秒)
     """
     ext = os.path.splitext(path)[1].lower().lstrip(".")
     ext = ext_map.get(ext, ext)
@@ -556,33 +843,58 @@ def print_file(path, printer_name, opts, ext_map, sumatra_exe, log):
         raise RuntimeError(f"不支持的格式: .{ext} (可在扩展名映射中添加别名)")
     page_set = parse_page_range(opts.get("pages"))
     copies, color, duplex = settings_to_devmode_values(opts.get("copies"), opts.get("color"), opts.get("duplex"))
+    paper_size, paper_source = paper_devmode_values(opts)
+    per_page = bool(opts.get("per_page"))
+    page_gap = to_float(opts.get("page_gap"), 0.0)
 
     if cat == CAT_RAW:
+        if paper_size or paper_source or per_page:
+            log("提示: RAW (prn/ps/pcl) 由文件内容自带版面, 纸型/逐页设置对它无效")
         print_raw(path, printer_name, log)
-    elif cat == CAT_PDF and sumatra_exe:
-        print_pdf_sumatra(sumatra_exe, path, printer_name, copies, color, duplex, page_set, log)
     elif cat == CAT_PDF:
-        # 无 Sumatra: 优先内置 PDF 渲染引擎, 不行再退回 Shell 动词
+        # 优先内置 PDF 渲染引擎 / Sumatra, 都不行再退回 Shell 动词
         try:
-            import pypdfium2  # noqa
-            print_pdf_gdi(path, printer_name, copies, color, duplex, page_set, log)
+            _print_pdf_path(path, printer_name, copies, color, duplex, page_set, log,
+                            opts, sumatra_exe)
         except ImportError:
-            _shell_print_with_defaults(path, printer_name, copies, color, duplex, log)
+            _shell_print_with_defaults(path, printer_name, copies, color, duplex, log,
+                                       paper_size=paper_size, paper_source=paper_source)
     elif cat in (CAT_TEXT, CAT_IMAGE):
         fn = print_text_gdi if cat == CAT_TEXT else print_image_gdi
-        fn(path, printer_name, copies, color, duplex, page_set, log)
+        fn(path, printer_name, copies, color, duplex, page_set, log,
+           paper_size=paper_size, paper_source=paper_source,
+           per_page=per_page, page_gap=page_gap)
     else:
-        _shell_print_with_defaults(path, printer_name, copies, color, duplex, log)
+        done = False
+        if opts.get("office_com", True):
+            try:
+                print_office_com(path, printer_name, copies, color, duplex,
+                                 page_set, opts, sumatra_exe, log,
+                                 kind=office_core.ext_kind("." + ext))
+                done = True
+            except OfficeUnavailable as e:
+                log(f"提示: {e} — 改用系统关联程序打印")
+            except Exception as e:
+                log(f"⚠ Office 静默打印失败: {e} — 退回系统关联程序打印")
+        if not done:
+            _shell_print_with_defaults(path, printer_name, copies, color, duplex, log,
+                                       paper_size=paper_size, paper_source=paper_source,
+                                       per_page=per_page)
 
 
-def _shell_print_with_defaults(path, printer_name, copies, color, duplex, log):
+def _shell_print_with_defaults(path, printer_name, copies, color, duplex, log,
+                               paper_size=None, paper_source=None, per_page=False):
     ctx = None
     note = []
     try:
-        ctx = apply_printer_defaults(printer_name, copies=copies, color=color, duplex=duplex)
-        note.append("已临时应用份数/色彩/双面到打印机默认值")
+        ctx = apply_printer_defaults(printer_name, copies=copies, color=color,
+                                     duplex=duplex, paper_size=paper_size,
+                                     paper_source=paper_source)
+        note.append("已临时应用份数/色彩/双面/纸型到打印机默认值")
     except PrinterSettingsError as e:
         log(f"提示: 无法修改打印机默认设置 ({e}), 将按打印机当前默认值打印")
+    if per_page:
+        log("提示: 该格式由系统关联程序打印, 无法逐页拆分成多个作业")
     try:
         # 单文件单独调用时也要保证打到所选打印机 (批量打印时外层已切换, 这里是无操作)
         with default_printer_guard(printer_name, log) as guard:
@@ -597,3 +909,4 @@ def _shell_print_with_defaults(path, printer_name, copies, color, duplex, log):
             # 等待关联程序把作业读入后台再恢复默认值
             time.sleep(2.5)
             restore_printer_defaults(*ctx)
+

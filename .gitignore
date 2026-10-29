@@ -18,3 +18,7 @@ app_preview.png
 # 系统
 Thumbs.db
 .DS_Store
+
+# 开发期临时目录 (探测/截图)
+_probe/
+_shots/
