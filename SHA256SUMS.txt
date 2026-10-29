@@ -1,0 +1,2 @@
+c5c833d55f024df8953b11bd11aa1f5b96af2a4b887cc85966177c595fe6eb78 *BatchPrinter-Setup.exe
+26cc20db937b964cd34334459eba893d23c80138ff234f93131ba2dbf3131aa8 *BatchPrinter-portable.zip
