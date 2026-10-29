@@ -27,10 +27,11 @@ from PySide6.QtWidgets import (
     QCheckBox, QLineEdit, QTextEdit, QFileDialog, QMessageBox, QDialog,
     QHeaderView, QAbstractItemView, QGroupBox, QSplitter, QToolBar, QStyle,
     QTableWidgetSelectionRange, QMenu, QDoubleSpinBox, QScrollArea, QListWidget,
+    QSizePolicy, QFrame,
 )
 
 import office_core
-from preview_ui import PreviewWindow, prune_cache
+from preview_ui import PreviewPanel, prune_cache
 from printer_core import (
     list_printers, get_default_printer, find_sumatra, print_file,
     resolve_category, all_known_exts, parse_page_range,
@@ -39,7 +40,10 @@ from printer_core import (
 from archive_util import extract_archive, cleanup_dir, is_archive
 
 APP_NAME = "BatchPrinter"
-APP_VERSION = "1.2.0"
+PREVIEW_MIN_W = 240          # 预览列最窄
+PREVIEW_DEFAULT_W = 330      # 默认宽度
+PREVIEW_MAX_W = 620          # 最宽
+APP_VERSION = "1.3.0"
 
 APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
@@ -93,9 +97,8 @@ DEFAULT_CONFIG = {
     "interval": 2.0,
     "sumatra_path": "",
     "ext_map": {},
-    "preview_auto": True,       # 单击文件自动弹出预览
-    "preview_pin": False,       # 预览小窗置顶
-    "preview_geo": None,        # 预览小窗位置/大小 [x, y, w, h]
+    "preview_show": True,       # 主界面里是否显示预览面板
+    "preview_width": 330,       # 预览面板宽度 (像素)
 }
 
 COLOR_LABELS = {"": "跟随打印机", "color": "彩色", "mono": "黑白"}
@@ -336,7 +339,12 @@ class BatchPrinterApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"批量打印助手 v{APP_VERSION} - Batch Printer")
-        self.resize(1180, 780)
+        self.resize(1360, 800)
+        scr = QApplication.primaryScreen()
+        if scr is not None:                       # 小屏幕下别超出桌面
+            av = scr.availableGeometry()
+            self.resize(min(self.width(), max(1000, av.width() - 60)),
+                        min(self.height(), max(620, av.height() - 80)))
 
         self.cfg = load_config()
         self.items = []
@@ -347,7 +355,6 @@ class BatchPrinterApp(QMainWindow):
         self.print_thread = None
         self.cancel_event = threading.Event()
         self._preview_row = -1
-        self._shutting_down = False
         self.sig = WorkerSignals()
         self.sig.log.connect(self._log)
         self.sig.status.connect(self._set_status)
@@ -359,8 +366,6 @@ class BatchPrinterApp(QMainWindow):
         self._sync_layout_ui()
         self._refresh_engine_label()
         self.setAcceptDrops(True)
-
-        self._build_preview_window()
 
         # 单击列表某行 -> 延迟 120ms 再生成预览 (连续点选时只预览最后一个)
         self._preview_timer = QTimer(self)
@@ -378,7 +383,7 @@ class BatchPrinterApp(QMainWindow):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
-        # 工具栏
+        # 第一行: 添加/移除/排序
         bar = QHBoxLayout()
         btns = [
             ("📁 添加文件", self.add_files),
@@ -393,25 +398,8 @@ class BatchPrinterApp(QMainWindow):
             b.clicked.connect(fn)
             bar.addWidget(b)
             if i == 2:
-                bar.addSpacing(18)
-        bar.addStretch()
-        # 顺序控制
-        for t, fn, tip in (("↑ 上移", lambda: self.move_selected(-1), "把选中行上移一位"),
-                           ("↓ 下移", lambda: self.move_selected(1), "把选中行下移一位"),
-                           ("⚙ 批量设置选中", lambda: self.batch_settings(),
-                            "对选中的多个文件统一设置份数/色彩/双面/页码范围 (Ctrl/Shift 多选)")):
-            b = QPushButton(t)
-            b.setToolTip(tip)
-            b.clicked.connect(fn)
-            bar.addWidget(b)
-        # 预览小窗开关 (单击文件会自动预览)
-        self.preview_btn = QPushButton("👁 打印预览")
-        self.preview_btn.setCheckable(True)
-        self.preview_btn.setToolTip("显示/隐藏打印预览小窗 (单击列表中的文件即自动预览)\n"
-                                    "预览内容与真正打印完全一致, 不耗纸")
-        self.preview_btn.toggled.connect(self.toggle_preview_window)
-        bar.addWidget(self.preview_btn)
-        bar.addSpacing(14)
+                bar.addSpacing(14)
+        bar.addStretch(1)
         bar.addWidget(QLabel("排序:"))
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(list(SORT_MODES.keys()))
@@ -421,19 +409,35 @@ class BatchPrinterApp(QMainWindow):
         bar.addWidget(self.sort_combo)
         root.addLayout(bar)
 
-        # 打印机行
+        # 第二行: 打印机 + 列表顺序/批量设置 + 预览开关
         prow = QHBoxLayout()
         prow.addWidget(QLabel("打印机:"))
         self.printer_combo = QComboBox()
-        self.printer_combo.setMinimumWidth(420)
-        prow.addWidget(self.printer_combo)
+        self.printer_combo.setMinimumWidth(180)
+        self.printer_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        prow.addWidget(self.printer_combo, 1)
         refresh = QPushButton("刷新")
-        refresh.setFixedWidth(60)
+        refresh.setFixedWidth(56)
         refresh.clicked.connect(self.refresh_printers)
         prow.addWidget(refresh)
         self.sumatra_lbl = QLabel("")
         prow.addWidget(self.sumatra_lbl)
-        prow.addStretch()
+        prow.addSpacing(10)
+        for t, fn, tip in (("↑ 上移", lambda: self.move_selected(-1), "把选中行上移一位"),
+                           ("↓ 下移", lambda: self.move_selected(1), "把选中行下移一位"),
+                           ("⚙ 批量设置", lambda: self.batch_settings(),
+                            "对选中的多个文件统一设置份数/色彩/双面/页码范围 (Ctrl/Shift 多选)")):
+            b = QPushButton(t)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            prow.addWidget(b)
+        # 预览面板开关 (单击文件会自动预览)
+        self.preview_btn = QPushButton("👁 打印预览")
+        self.preview_btn.setCheckable(True)
+        self.preview_btn.setToolTip("显示/隐藏预览面板 (单击列表中的文件即自动预览)\n"
+                                    "预览与真正打印完全一致, 不耗纸")
+        self.preview_btn.toggled.connect(self.toggle_preview_window)
+        prow.addWidget(self.preview_btn)
         root.addLayout(prow)
 
         # 主体: 表格 + 设置
@@ -461,14 +465,30 @@ class BatchPrinterApp(QMainWindow):
         self.table.setDefaultDropAction(Qt.MoveAction)
         self.table.setDragDropOverwriteMode(False)
         left = QWidget()
-        lv0 = QVBoxLayout(left)
+        lh = QHBoxLayout(left)
+        lh.setContentsMargins(0, 0, 0, 0)
+        lh.setSpacing(6)
+
+        table_area = QWidget()
+        lv0 = QVBoxLayout(table_area)
         lv0.setContentsMargins(0, 0, 0, 0)
         lv0.setSpacing(4)
         lv0.addWidget(self.table, 1)
-        self.drag_hint = QLabel("💡 单击文件即在预览小窗显示效果; 列表顺序 = 打印顺序, 拖动行可调整先后; "
-                                "双击设置单个文件, 多选后可点「批量设置选中」统一设置")
+        self.drag_hint = QLabel("💡 单击文件即在右侧预览; 列表顺序 = 打印顺序 (可拖动行调整); "
+                                "双击设置单个文件")
+        self.drag_hint.setWordWrap(True)
         self.drag_hint.setStyleSheet("color:#666;font-size:11px;")
         lv0.addWidget(self.drag_hint)
+        lh.addWidget(table_area, 1)
+
+        # ---- 预览面板 (紧挨列表右侧, 固定宽度, 可整块收起)
+        self._build_preview_pane()
+        vline = QFrame()
+        vline.setFrameShape(QFrame.VLine)
+        vline.setFrameShadow(QFrame.Sunken)
+        lh.addWidget(vline)
+        lh.addWidget(self.preview_win, 0)
+
         splitter.addWidget(left)
 
         right = QWidget()
@@ -564,7 +584,18 @@ class BatchPrinterApp(QMainWindow):
         self.stop_btn.clicked.connect(self.stop_print)
         rv.addWidget(self.stop_btn)
         splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1)
+        self.splitter = splitter
+        splitter.setStretchFactor(0, 1)     # 表格区吃掉多余宽度, 设置栏保持固定
+        splitter.setStretchFactor(1, 0)
+        splitter.setChildrenCollapsible(False)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setHandleWidth(5)
+        self._apply_preview_width()
+
+        self.preview_btn.blockSignals(True)
+        self.preview_btn.setChecked(bool(self.cfg.get("preview_show", True)))
+        self.preview_btn.blockSignals(False)
 
         # 日志
         logg = QGroupBox(" 日志 ")
@@ -608,11 +639,8 @@ class BatchPrinterApp(QMainWindow):
             self.cfg["interval"] = 2.0
         self.cfg["sumatra_path"] = self.sumatra_edit.text().strip()
         pw = getattr(self, "preview_win", None)
-        if pw is not None:
-            g = pw.geometry()
-            self.cfg["preview_geo"] = [g.x(), g.y(), g.width(), g.height()]
-            self.cfg["preview_pin"] = pw.pin_btn.isChecked()
-            self.cfg["preview_auto"] = pw.follow_chk.isChecked()
+        if pw is not None and pw.isVisible() and pw.width() > 60:
+            self.cfg["preview_width"] = pw.width()     # 记住用户拖出来的宽度
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(self.cfg, f, ensure_ascii=False, indent=2)
@@ -632,10 +660,13 @@ class BatchPrinterApp(QMainWindow):
     def _refresh_sumatra_label(self):
         exe = find_sumatra(self.sumatra_edit.text().strip())
         if exe:
-            self.sumatra_lbl.setText("✔ 检测到 SumatraPDF (PDF 静默打印最优)")
+            self.sumatra_lbl.setText("✔ SumatraPDF")
+            self.sumatra_lbl.setToolTip("已检测到 SumatraPDF, PDF 静默打印效果最佳")
             self.sumatra_lbl.setStyleSheet("color:#1c7c2e;")
         else:
-            self.sumatra_lbl.setText("PDF 使用内置渲染引擎 (安装 SumatraPDF 效果更佳)")
+            self.sumatra_lbl.setText("PDF: 内置引擎")
+            self.sumatra_lbl.setToolTip("未安装 SumatraPDF, 使用程序内置渲染引擎\n"
+                                        "安装后可获得更精确的 PDF 打印控制")
             self.sumatra_lbl.setStyleSheet("color:#0a7d32;")
 
     def _browse_sumatra(self):
@@ -699,99 +730,62 @@ class BatchPrinterApp(QMainWindow):
             self._log("版面设置: " + (office_core.layout_summary(self.layout_opts())
                                       or "保持原文件版面"))
             if hasattr(self, "preview_win"):
-                self.preview_win.refresh()      # 面板改完立刻在预览小窗看效果
+                self.preview_win.refresh()      # 面板改完立刻在预览面板看效果
 
-    # ------------------------------------------------------------ 打印预览小窗
+    # ------------------------------------------------------------ 打印预览面板
 
-    def _build_preview_window(self):
-        """预览是独立小窗: 不占主界面空间, 可拖动/置顶/关闭"""
+    def _build_preview_pane(self):
+        """预览面板: 嵌在列表与设置之间, 单击文件即刷新, 可整块收起"""
         try:
             prune_cache()                   # 清掉上次遗留的预览缓存, 防止临时目录膨胀
         except Exception:
             pass
-        self.preview_win = PreviewWindow(self)
+        self.preview_win = PreviewPanel(self)
         self.preview_win.print_handler = self._print_from_preview
-        self.preview_win.auto_changed.connect(self._on_preview_auto_changed)
-        self.preview_win.closed.connect(self._on_preview_closed)
 
-        self.preview_win.follow_chk.blockSignals(True)
-        self.preview_win.follow_chk.setChecked(bool(self.cfg.get("preview_auto", True)))
-        self.preview_win.follow_chk.blockSignals(False)
+    def _preview_width_cfg(self):
+        try:
+            w = int(self.cfg.get("preview_width", PREVIEW_DEFAULT_W) or PREVIEW_DEFAULT_W)
+        except (TypeError, ValueError):
+            w = PREVIEW_DEFAULT_W
+        return max(PREVIEW_MIN_W, min(PREVIEW_MAX_W, w))
 
-        self.preview_win.pin_btn.blockSignals(True)
-        self.preview_win.pin_btn.setChecked(bool(self.cfg.get("preview_pin", False)))
-        self.preview_win.pin_btn.blockSignals(False)
-        if self.cfg.get("preview_pin"):
-            self.preview_win.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+    def _apply_preview_width(self):
+        """按配置设置预览列宽度与显隐 (宽度固定, 不参与拉伸)"""
+        pw = self.preview_win
+        pw.setFixedWidth(self._preview_width_cfg())
+        pw.setVisible(bool(self.cfg.get("preview_show", True)))
 
-        geo = self.cfg.get("preview_geo")
-        if isinstance(geo, (list, tuple)) and len(geo) == 4:
-            try:
-                self.preview_win.setGeometry(int(geo[0]), int(geo[1]),
-                                             max(300, int(geo[2])), max(340, int(geo[3])))
-                self._preview_geo_set = True
-            except (TypeError, ValueError):
-                self._preview_geo_set = False
-        else:
-            self._preview_geo_set = False
+    def _expand_pane(self):
+        """展开预览列 (只调宽度, 不触发转换)"""
+        pw = self.preview_win
+        pw.setFixedWidth(self._preview_width_cfg())
+        pw.setVisible(True)
+
+    def _collapse_pane(self):
+        pw = self.preview_win
+        if pw.width() > 60:
+            self.cfg["preview_width"] = pw.width()
+        pw.setVisible(False)
 
     def toggle_preview_window(self, on):
+        """工具栏按钮: 展开/收起预览面板"""
         pw = getattr(self, "preview_win", None)
         if pw is None:
             return
         if on:
-            # 手动打开 = 恢复"单击即预览"
-            pw.follow_chk.blockSignals(True)
-            pw.follow_chk.setChecked(True)
-            pw.follow_chk.blockSignals(False)
-            self.cfg["preview_auto"] = True
-            self._place_preview_window(force=False)
-            pw.show()
-            pw.raise_()
+            self._expand_pane()
             row = self._preview_row
             if not (0 <= row < len(self.items)):
                 rows = self.selected_rows()
                 row = rows[0] if rows else -1
             if 0 <= row < len(self.items):
-                self._preview_row_at(row, force=True)
+                self._preview_row_at(row)
             else:
                 pw.clear()
         else:
-            pw.close()
-
-    def _place_preview_window(self, force=False):
-        """第一次显示时放到主窗口右侧; 用户拖动过就沿用记住的位置"""
-        pw = self.preview_win
-        if self._preview_geo_set and not force:
-            return
-        scr = self.screen().availableGeometry() if self.screen() else None
-        w, h = pw.width(), pw.height()
-        x = self.x() + self.width() + 8
-        y = self.y() + 40
-        if scr is not None:
-            if x + w > scr.right():
-                x = max(scr.left() + 8, self.x() - w - 8)
-            y = min(max(scr.top() + 8, y), scr.bottom() - h - 8)
-        else:
-            x = self.x() + self.width() - w - 30
-        pw.move(x, y)
-
-    def _on_preview_auto_changed(self, on):
-        self.cfg["preview_auto"] = bool(on)
-        self.save_config()
-        self._log("预览跟随选择: " + ("开" if on else "关"))
-
-    def _on_preview_closed(self):
-        """用户关掉小窗: 按钮取消勾选, 并暂停"单击即预览"(再点按钮可恢复)"""
-        self.preview_btn.blockSignals(True)
-        self.preview_btn.setChecked(False)
-        self.preview_btn.blockSignals(False)
-        if self._shutting_down:                 # 程序退出时不改用户的偏好
-            return
-        self.preview_win.follow_chk.blockSignals(True)
-        self.preview_win.follow_chk.setChecked(False)
-        self.preview_win.follow_chk.blockSignals(False)
-        self.cfg["preview_auto"] = False
+            self._collapse_pane()
+        self.cfg["preview_show"] = bool(on)
         self.save_config()
 
     def _on_current_changed(self, row, *_):
@@ -799,7 +793,7 @@ class BatchPrinterApp(QMainWindow):
         if row is None or row < 0:
             return
         self._preview_row = int(row)
-        if not self.cfg.get("preview_auto", True):
+        if not self.preview_win.isVisible():    # 面板收起时不做无用转换
             return
         if self._printing():
             return
@@ -808,23 +802,23 @@ class BatchPrinterApp(QMainWindow):
     def _preview_current(self):
         row = self._preview_row
         if 0 <= row < len(self.items):
-            self._preview_row_at(row, force=False)
+            self._preview_row_at(row)
 
     def _preview_row_at(self, row, force=False):
         if not (0 <= row < len(self.items)):
             return
         if self._printing():
             return
-        if not force and not self.cfg.get("preview_auto", True):
-            return
-        item = self.items[row]
         pw = self.preview_win
         if not pw.isVisible():
-            self._place_preview_window(force=False)
-            pw.show()
-        self.preview_btn.blockSignals(True)
-        self.preview_btn.setChecked(True)
-        self.preview_btn.blockSignals(False)
+            if not force:                   # 收起状态就不偷偷展开
+                return
+            self.cfg["preview_show"] = True
+            self.preview_btn.blockSignals(True)
+            self.preview_btn.setChecked(True)
+            self.preview_btn.blockSignals(False)
+            self._expand_pane()
+        item = self.items[row]
         pw.set_file(item["path"], self._opts_for_item(item), self._ext_map(),
                     self.current_printer())
 
@@ -840,7 +834,7 @@ class BatchPrinterApp(QMainWindow):
         }
 
     def _print_from_preview(self, path, opts):
-        """预览小窗里点「打印此文件」"""
+        """预览面板里点「打印此文件」"""
         if self._printing():
             QMessageBox.information(self, "提示", "已有打印任务正在进行, 请稍后再试")
             return False
@@ -863,7 +857,7 @@ class BatchPrinterApp(QMainWindow):
         return True
 
     def preview_selected(self, *_):
-        """菜单/右键: 打开预览小窗并预览当前选中的文件"""
+        """菜单/右键: 展开预览面板并预览当前选中的文件"""
         rows = self.selected_rows()
         if not rows:
             QMessageBox.information(self, "提示", "请先在列表中选中要预览的文件")
@@ -1139,7 +1133,7 @@ class BatchPrinterApp(QMainWindow):
         rows = self.selected_rows()
         m = QMenu(self)
         n = len(rows)
-        act_preview = m.addAction("👁 在预览小窗中查看" if n <= 1 else "👁 在预览小窗中查看第一个")
+        act_preview = m.addAction("👁 在预览面板中查看" if n <= 1 else "👁 预览第一个选中的")
         act_preview.triggered.connect(self.preview_selected)
         act_preview.setEnabled(bool(rows) and n >= 1)
         act_set = m.addAction(f"⚙ 批量设置选中的 {n} 个文件" if n > 1 else "⚙ 设置此文件")
@@ -1510,12 +1504,10 @@ class BatchPrinterApp(QMainWindow):
                 e.ignore()
                 return
             self.cancel_event.set()
-        self.save_config()
-        self._shutting_down = True
         pw = getattr(self, "preview_win", None)
+        self.save_config()
         if pw is not None:
             pw.shutdown()                    # 停掉后台预览线程, 关掉临时 Word/Excel
-            pw.close()
         for t in self.temp_roots:
             cleanup_dir(t)
         e.accept()

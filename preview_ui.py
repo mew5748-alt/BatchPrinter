@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-preview_ui.py - 打印预览小窗
+preview_ui.py - 打印预览面板
 
 设计要点:
-  1. 独立小窗 (Qt.Tool): 不占主界面空间, 不抢焦点, 可拖动/置顶/关闭
+  1. 内嵌在主窗口里 (不弹窗): 占一列, 拖动分隔条调宽窄, 可整块收起
   2. 单击列表文件立即刷新预览: 转换在后台线程做, 界面不会卡
   3. 预览内容与真正打印用的是同一份 PDF (Office 先按当前版面转 PDF)
   4. 转好的 PDF 按 (文件, 修改时间, 版面) 缓存在临时目录, 来回点选秒开
@@ -151,19 +151,17 @@ class PreviewLoader:
         return out
 
 
-class PreviewWindow(QWidget):
-    """打印预览小窗 (独立窗口, 单击文件即刷新)"""
+class PreviewPanel(QWidget):
+    """打印预览面板 (嵌在主窗口里, 单击列表文件即刷新)
 
-    closed = Signal()
-    auto_changed = Signal(bool)
+    与独立窗口的区别: 不抢焦点、不用管理位置; 主界面里固定占一列,
+    拖动分隔条就能调宽窄, 点工具栏按钮可整块收起。
+    """
 
     def __init__(self, parent=None):
-        super().__init__(parent, Qt.Tool | Qt.Window)
-        self.setWindowTitle("打印预览")
-        # show() 时不抢焦点, 这样单击列表后仍可用方向键继续翻文件
-        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        self.resize(430, 650)
-        self.setMinimumSize(300, 340)
+        super().__init__(parent)
+        self.setObjectName("previewPanel")
+        self.setMinimumWidth(210)
 
         self._sig = PreviewSignals()
         self._sig.ready.connect(self._on_ready)
@@ -182,10 +180,11 @@ class PreviewWindow(QWidget):
         self._opts = {}
         self._ext_map = {}
         self._printer = ""
+        self._dirty = False
         self.print_handler = None            # callable(path, opts) -> bool
         self._build()
 
-        # 拖动边框时不要每一帧都重渲染, 停 140ms 再按新宽度出图
+        # 拖动分隔条时不要每一帧都重渲染, 停 140ms 再按新宽度出图
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
         self._resize_timer.setInterval(140)
@@ -194,67 +193,58 @@ class PreviewWindow(QWidget):
     # ------------------------------------------------------------ 界面
     def _build(self):
         v = QVBoxLayout(self)
-        v.setContentsMargins(8, 8, 8, 8)
-        v.setSpacing(6)
+        v.setContentsMargins(6, 2, 2, 2)
+        v.setSpacing(4)
 
-        head = QHBoxLayout()
-        head.setSpacing(6)
-        self.title_lbl = QLabel("未选择文件")
-        self.title_lbl.setStyleSheet("font-weight:bold;")
-        self.title_lbl.setMinimumWidth(60)
-        head.addWidget(self.title_lbl, 1)
-
-        self.follow_chk = QCheckBox("跟随选择")
-        self.follow_chk.setToolTip("勾选后, 单击列表中的文件就立即显示预览")
-        self.follow_chk.setChecked(True)
-        self.follow_chk.toggled.connect(self._on_follow)
-        head.addWidget(self.follow_chk)
-
-        self.pin_btn = QPushButton("📌")
-        self.pin_btn.setCheckable(True)
-        self.pin_btn.setFixedSize(28, 24)
-        self.pin_btn.setToolTip("置顶显示 (不被其他窗口遮挡)")
-        self.pin_btn.toggled.connect(self._on_pin)
-        head.addWidget(self.pin_btn)
-        v.addLayout(head)
+        self.title_lbl = QLabel("打印预览")
+        self.title_lbl.setStyleSheet("font-weight:bold;font-size:12px;color:#333;")
+        self.title_lbl.setTextInteractionFlags(Qt.NoTextInteraction)
+        v.addWidget(self.title_lbl)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(False)
-        self.scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
-        self.scroll.setStyleSheet("QScrollArea{border:1px solid #c8c8c8;background:#4a4a4a;}"
-                                 "QScrollArea > QWidget > QWidget{background:#4a4a4a;}")
-        self.canvas = QLabel("单击左侧列表中的文件即可预览")
+        self.scroll.setAlignment(Qt.AlignCenter)
+        self.scroll.setStyleSheet(
+            "QScrollArea{border:1px solid #c8c8c8;background:#e6e6e6;}"
+            "QScrollArea > QWidget > QWidget{background:#e6e6e6;}")
+        self.canvas = QLabel("单击列表中的文件\n即可在这里预览")
         self.canvas.setAlignment(Qt.AlignCenter)
         self.canvas.setWordWrap(True)
-        self.canvas.setStyleSheet("background:#4a4a4a;color:#eee;padding:16px;")
-        self.canvas.setMinimumSize(240, 200)
+        self.canvas.setStyleSheet("background:#e6e6e6;color:#888;padding:8px;"
+                                  "font-size:11px;")
+        self.canvas.setMinimumSize(150, 120)
         self.scroll.setWidget(self.canvas)
         v.addWidget(self.scroll, 1)
 
         nav = QHBoxLayout()
-        nav.setSpacing(4)
+        nav.setSpacing(2)
         self.prev_btn = QPushButton("◀")
-        self.prev_btn.setFixedSize(30, 24)
+        self.prev_btn.setFixedSize(24, 22)
+        self.prev_btn.setToolTip("上一页 (或按 ↑↓ 换文件)")
         self.next_btn = QPushButton("▶")
-        self.next_btn.setFixedSize(30, 24)
+        self.next_btn.setFixedSize(24, 22)
+        self.next_btn.setToolTip("下一页")
         self.page_lbl = QLabel("—")
         self.page_lbl.setAlignment(Qt.AlignCenter)
-        self.page_lbl.setMinimumWidth(60)
+        self.page_lbl.setMinimumWidth(40)
+        self.page_lbl.setStyleSheet("font-size:11px;")
         self.prev_btn.clicked.connect(lambda: self._go(-1))
         self.next_btn.clicked.connect(lambda: self._go(1))
         nav.addWidget(self.prev_btn)
         nav.addWidget(self.page_lbl)
         nav.addWidget(self.next_btn)
-        nav.addStretch()
-        fit = QPushButton("适合宽度")
-        fit.setFixedHeight(24)
-        fit.clicked.connect(self._fit)
+        nav.addStretch(1)
+
+        fit = QPushButton("⤢")
+        fit.setFixedSize(24, 22)
+        fit.setToolTip("适合宽度")
         z_out = QPushButton("－")
-        z_out.setFixedSize(26, 24)
+        z_out.setFixedSize(22, 22)
         z_out.setToolTip("缩小")
         z_in = QPushButton("＋")
-        z_in.setFixedSize(26, 24)
+        z_in.setFixedSize(22, 22)
         z_in.setToolTip("放大")
+        fit.clicked.connect(self._fit)
         z_out.clicked.connect(lambda: self._zoom_by(-0.2))
         z_in.clicked.connect(lambda: self._zoom_by(0.2))
         nav.addWidget(fit)
@@ -263,18 +253,17 @@ class PreviewWindow(QWidget):
         v.addLayout(nav)
 
         self.info = QLabel("")
-        self.info.setStyleSheet("color:#666;font-size:11px;")
-        self.info.setWordWrap(True)
+        self.info.setStyleSheet("color:#777;font-size:11px;")
+        self.info.setMinimumWidth(60)
+        self._info_full = ""
         v.addWidget(self.info)
 
-        bottom = QHBoxLayout()
         self.print_btn = QPushButton("🖨 打印此文件")
+        self.print_btn.setFixedHeight(26)
+        self.print_btn.setToolTip("只打印当前预览的这一个文件")
+        self.print_btn.setEnabled(False)
         self.print_btn.clicked.connect(self._print)
-        close_b = QPushButton("关闭")
-        close_b.clicked.connect(self.close)
-        bottom.addWidget(self.print_btn, 1)
-        bottom.addWidget(close_b)
-        v.addLayout(bottom)
+        v.addWidget(self.print_btn)
         self._update_nav()
 
     # ------------------------------------------------------------ 对外接口
@@ -285,7 +274,7 @@ class PreviewWindow(QWidget):
         self._ext_map = dict(ext_map or {})
         self._printer = printer or ""
         name = os.path.basename(path)
-        self.title_lbl.setText(self._elide(name))
+        self.title_lbl.setText("预览: " + self._elide(name, 28))
         self.title_lbl.setToolTip(path)
         self.print_btn.setEnabled(True)
 
@@ -298,9 +287,10 @@ class PreviewWindow(QWidget):
         self._close_doc()
         self._pages, self._page = 0, 0
         self.canvas.setPixmap(QPixmap())
-        self.canvas.setText("正在生成预览…\n" + name)
-        self.canvas.resize(240, 160)
-        self.info.setText("Office 文件首次预览需要转换成 PDF, 约 1 秒")
+        self.canvas.setText("正在生成预览…")
+        self.canvas.resize(150, 110)
+        self._info_full = ""
+        self.info.setText("正在转换…")
         self._update_nav()
         self._loader.submit(self._seq, path, self._opts, self._ext_map)
 
@@ -308,6 +298,10 @@ class PreviewWindow(QWidget):
         """版面等设置变化后重新生成 (缓存键带版面, 会自动重转)"""
         if not self._path:
             return
+        if not self.isVisible():            # 收起状态先记下来, 展开时再转
+            self._dirty = True
+            return
+        self._dirty = False
         self._key = None
         self.set_file(self._path, self._opts, self._ext_map, self._printer)
 
@@ -315,14 +309,18 @@ class PreviewWindow(QWidget):
         self._seq += 1
         self._key = None
         self._path = ""
+        self._dirty = False
         self._close_doc()
         self._pages, self._page = 0, 0
-        self.title_lbl.setText("未选择文件")
+        self.title_lbl.setText("打印预览")
         self.title_lbl.setToolTip("")
         self.canvas.setPixmap(QPixmap())
-        self.canvas.setText("单击左侧列表中的文件即可预览")
-        self.canvas.resize(240, 160)
+        self.canvas.setText("单击列表中的文件\n即可在这里预览")
+        self.canvas.resize(150, 110)
+        self._info_full = ""
         self.info.setText("")
+        self.info.setToolTip("")
+        self.print_btn.setEnabled(False)
         self._update_nav()
 
     def shutdown(self):
@@ -361,9 +359,11 @@ class PreviewWindow(QWidget):
         self._close_doc()
         self._pages, self._page = 0, 0
         self.canvas.setPixmap(QPixmap())
-        self.canvas.setText("无法预览\n" + os.path.basename(self._path))
-        self.canvas.resize(240, 160)
-        self.info.setText(msg)
+        self.canvas.setText("无法预览\n" + self._elide(os.path.basename(self._path), 20))
+        self.canvas.resize(150, 110)
+        self._info_full = ""
+        self.info.setText("不支持预览")
+        self.info.setToolTip(msg)
         self._update_nav()
 
     @staticmethod
@@ -391,7 +391,7 @@ class PreviewWindow(QWidget):
             return
         self._page = idx
         self._update_nav()
-        avail = max(180, self.scroll.viewport().width() - 24)
+        avail = max(120, self.scroll.viewport().width() - 16)
         try:
             if self._pdf is not None:
                 page = self._pdf[idx]
@@ -407,7 +407,7 @@ class PreviewWindow(QWidget):
                 if img.width() != target:
                     img = img.scaledToWidth(target, Qt.SmoothTransformation)
             self.canvas.setPixmap(QPixmap.fromImage(img))
-            self.canvas.resize(img.width() + 12, img.height() + 12)
+            self.canvas.resize(img.width() + 8, img.height() + 8)
         except Exception as e:
             self.canvas.setText("渲染第 %d 页失败: %s" % (idx + 1, e))
 
@@ -424,33 +424,35 @@ class PreviewWindow(QWidget):
 
     def _update_nav(self):
         n = self._pages
-        self.page_lbl.setText("%d / %d" % (self._page + 1, n) if n else "—")
+        self.page_lbl.setText("%d/%d" % (self._page + 1, n) if n else "—")
         self.prev_btn.setEnabled(n > 0 and self._page > 0)
         self.next_btn.setEnabled(n > 0 and self._page < n - 1)
 
     def _update_info(self):
         copies = self._opts.get("copies")
-        lay = office_core.layout_summary(self._opts.get("layout")) or "原文件版面"
-        self.info.setText("%s · 共 %d 页 · 打印机: %s · 份数: %s · 版面: %s"
-                          % (self._note or "预览", self._pages,
-                             self._printer or "—", copies or "打印机默认", lay))
+        lay = office_core.layout_summary(self._opts.get("layout")) or "原版面"
+        self._info_full = "%d 页 · %s 份 · %s" % (self._pages, copies or "默认", lay)
+        self.info.setToolTip("打印机: %s\n%s\n版面: %s"
+                             % (self._printer or "—", self._note or "", lay))
+        self._elide_info()
+
+    def _elide_info(self):
+        if not self._info_full:
+            self.info.setText("")
+            return
+        w = max(40, self.info.width())
+        self.info.setText(self.info.fontMetrics().elidedText(
+            self._info_full, Qt.ElideRight, w))
 
     def _layout_key(self):
         return json.dumps(office_core.normalize_layout(self._opts.get("layout")),
                           sort_keys=True)
 
     @staticmethod
-    def _elide(name, limit=42):
+    def _elide(name, limit=28):
         return name if len(name) <= limit else name[:limit - 1] + "…"
 
     # ------------------------------------------------------------ 交互
-    def _on_follow(self, checked):
-        self.auto_changed.emit(bool(checked))
-
-    def _on_pin(self, on):
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, on)
-        self.show()                         # 改窗口标志后需要重新 show
-
     def _print(self):
         if not self._path or not self.print_handler:
             return
@@ -460,23 +462,17 @@ class PreviewWindow(QWidget):
         if self._pages:
             self._show_page(self._page)
 
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self._dirty:                     # 收起期间改过版面, 展开时补上
+            self.refresh()
+
     def resizeEvent(self, e):
         super().resizeEvent(e)
+        self._elide_info()
         if self._pages and getattr(self, "_resize_timer", None) is not None:
             self._resize_timer.start()
 
-    def keyPressEvent(self, e):
-        if e.key() == Qt.Key_Escape:
-            self.close()
-            return
-        if e.key() in (Qt.Key_Left, Qt.Key_PageUp):
-            self._go(-1)
-            return
-        if e.key() in (Qt.Key_Right, Qt.Key_PageDown):
-            self._go(1)
-            return
-        super().keyPressEvent(e)
 
-    def closeEvent(self, e):
-        self.closed.emit()
-        e.accept()
+# 兼容旧名字 (v1.2.0 的独立窗口类名)
+PreviewWindow = PreviewPanel
