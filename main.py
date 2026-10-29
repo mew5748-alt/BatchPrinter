@@ -9,12 +9,15 @@
 """
 
 import os
+import re
 import sys
 import json
+import ctypes
 import queue
 import threading
 import tempfile
 import shutil
+from functools import cmp_to_key
 
 from PySide6.QtCore import Qt, QObject, Signal
 from PySide6.QtGui import QColor, QAction
@@ -23,17 +26,55 @@ from PySide6.QtWidgets import (
     QPushButton, QComboBox, QLabel, QTableWidget, QTableWidgetItem, QSpinBox,
     QCheckBox, QLineEdit, QTextEdit, QFileDialog, QMessageBox, QDialog,
     QHeaderView, QAbstractItemView, QGroupBox, QSplitter, QToolBar, QStyle,
+    QTableWidgetSelectionRange, QMenu,
 )
 
 from printer_core import (
     list_printers, get_default_printer, find_sumatra, print_file,
-    resolve_category, all_known_exts,
+    resolve_category, all_known_exts, parse_page_range,
+    default_printer_guard, get_default_printer_name,
 )
 from archive_util import extract_archive, cleanup_dir, is_archive
+
+APP_NAME = "BatchPrinter"
+APP_VERSION = "1.0.2"
 
 APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+
+
+# ---------------------------------------------------------------- 文件排序
+# 打印顺序 = 列表顺序。文件夹/压缩包内文件按 Windows 资源管理器顺序排列:
+# 数字段按数值比较 (1, 2, 10 而非 1, 10, 2), 不区分大小写。
+try:
+    _StrCmpLogicalW = ctypes.windll.shlwapi.StrCmpLogicalW
+    _StrCmpLogicalW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    _StrCmpLogicalW.restype = ctypes.c_int
+except Exception:                                     # 非 Windows 环境兜底
+    _StrCmpLogicalW = None
+
+
+def _natural_key(name):
+    """纯 Python 自然排序键 (StrCmpLogicalW 不可用时使用)"""
+    parts = re.split(r"(\d+)", name.lower())
+    return [(0, int(p), "") if p.isdigit() else (1, 0, p) for p in parts if p != ""]
+
+
+def natural_cmp(a, b):
+    """比较两个名称, 返回 -1/0/1"""
+    if _StrCmpLogicalW is not None:
+        try:
+            return _StrCmpLogicalW(a, b)
+        except Exception:
+            pass
+    ka, kb = _natural_key(a), _natural_key(b)
+    return (ka > kb) - (ka < kb)
+
+
+def sort_names(names):
+    """按资源管理器顺序排序文件名列表"""
+    return sorted(names, key=cmp_to_key(natural_cmp))
 
 DEFAULT_CONFIG = {
     "printer": "",
@@ -53,6 +94,22 @@ DUPLEX_LABEL2VAL = {v: k for k, v in DUPLEX_LABELS.items()}
 STATUS_QUEUED = "等待中"
 C_SEQ, C_NAME, C_TYPE, C_COPIES, C_COLOR, C_DUPLEX, C_PAGES, C_STATUS = range(8)
 COLS = ["#", "文件名", "类型", "份数", "色彩", "双面", "页码范围", "状态"]
+
+# 排序方式: 显示名 -> 内部键
+SORT_MODES = {
+    "添加顺序": "added",
+    "文件名 (A→Z)": "name",
+    "修改时间 (早→晚)": "mtime_asc",
+    "修改时间 (晚→早)": "mtime_desc",
+}
+
+
+def file_mtime(path):
+    """文件修改时间 (取不到时返回 0, 保证可排序)"""
+    try:
+        return os.path.getmtime(path)
+    except Exception:
+        return 0
 STATUS_COLORS = {"已发送": "#1c7c2e", "失败": "#c0392b", "打印中": "#1a5fb4", "已取消": "#888"}
 
 
@@ -78,16 +135,64 @@ class WorkerSignals(QObject):
     done = Signal()
 
 
+class ReorderTable(QTableWidget):
+    """支持拖动行调整顺序的表格 (拖动即改变打印顺序)"""
+
+    _INTERNAL = "application/x-qabstractitemmodeldatalist"
+
+    def __init__(self, rows, cols, on_reorder, parent=None):
+        super().__init__(rows, cols, parent)
+        self._on_reorder = on_reorder
+
+    def _is_file_drop(self, ev):
+        """外部文件拖入 -> 交回主窗口处理, 不走行排序"""
+        md = ev.mimeData()
+        return md.hasUrls() and not md.hasFormat(self._INTERNAL)
+
+    def dragEnterEvent(self, ev):
+        if self._is_file_drop(ev):
+            ev.ignore()
+            return
+        super().dragEnterEvent(ev)
+
+    def dragMoveEvent(self, ev):
+        if self._is_file_drop(ev):
+            ev.ignore()
+            return
+        super().dragMoveEvent(ev)
+
+    def dropEvent(self, ev):
+        if self._is_file_drop(ev):
+            ev.ignore()
+            return
+        pos = ev.position().toPoint() if hasattr(ev, "position") else ev.pos()
+        drop_row = self.rowAt(pos.y())
+        ind = self.dropIndicatorPosition()
+        if drop_row < 0:
+            drop_row = self.rowCount()
+        elif ind == QAbstractItemView.BelowItem:
+            drop_row += 1
+        src = sorted({i.row() for i in self.selectedIndexes()})
+        if not src:
+            ev.ignore()
+            return
+        self._on_reorder(src, drop_row)
+        ev.setDropAction(Qt.MoveAction)
+        ev.accept()
+
+
 class BatchPrinterApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("批量打印助手 - Batch Printer")
+        self.setWindowTitle(f"批量打印助手 v{APP_VERSION} - Batch Printer")
         self.resize(1180, 780)
 
         self.cfg = load_config()
         self.items = []
         self.temp_roots = set()
         self._seq = 0
+        self._added_seq = 0
+        self._last_sort_label = "添加顺序"
         self.print_thread = None
         self.cancel_event = threading.Event()
         self.sig = WorkerSignals()
@@ -126,6 +231,23 @@ class BatchPrinterApp(QMainWindow):
             if i == 2:
                 bar.addSpacing(18)
         bar.addStretch()
+        # 顺序控制
+        for t, fn, tip in (("↑ 上移", lambda: self.move_selected(-1), "把选中行上移一位"),
+                           ("↓ 下移", lambda: self.move_selected(1), "把选中行下移一位"),
+                           ("⚙ 批量设置选中", lambda: self.batch_settings(),
+                            "对选中的多个文件统一设置份数/色彩/双面/页码范围 (Ctrl/Shift 多选)")):
+            b = QPushButton(t)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            bar.addWidget(b)
+        bar.addSpacing(14)
+        bar.addWidget(QLabel("排序:"))
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems(list(SORT_MODES.keys()))
+        self.sort_combo.setMinimumWidth(130)
+        self.sort_combo.setToolTip("对整个列表重排 (列表顺序 = 打印顺序)")
+        self.sort_combo.currentTextChanged.connect(self._on_sort_changed)
+        bar.addWidget(self.sort_combo)
         root.addLayout(bar)
 
         # 打印机行
@@ -147,7 +269,7 @@ class BatchPrinterApp(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         root.addWidget(splitter, 1)
 
-        self.table = QTableWidget(0, len(COLS))
+        self.table = ReorderTable(0, len(COLS), self._apply_reorder)
         self.table.setHorizontalHeaderLabels(COLS)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(C_NAME, QHeaderView.Stretch)
@@ -157,8 +279,26 @@ class BatchPrinterApp(QMainWindow):
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
-        self.table.doubleClicked.connect(self.edit_item_settings)
-        splitter.addWidget(self.table)
+        self.table.doubleClicked.connect(self._on_double_click)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._table_menu)
+        # 拖动行调整打印顺序
+        self.table.setDragEnabled(True)
+        self.table.setAcceptDrops(True)
+        self.table.setDropIndicatorShown(True)
+        self.table.setDragDropMode(QAbstractItemView.InternalMove)
+        self.table.setDefaultDropAction(Qt.MoveAction)
+        self.table.setDragDropOverwriteMode(False)
+        left = QWidget()
+        lv0 = QVBoxLayout(left)
+        lv0.setContentsMargins(0, 0, 0, 0)
+        lv0.setSpacing(4)
+        lv0.addWidget(self.table, 1)
+        self.drag_hint = QLabel("💡 列表顺序 = 打印顺序: 拖动行可调整先后; "
+                                "双击设置单个文件, 多选后双击/点「批量设置选中」统一设置")
+        self.drag_hint.setStyleSheet("color:#666;font-size:11px;")
+        lv0.addWidget(self.drag_hint)
+        splitter.addWidget(left)
 
         right = QGroupBox(" 全局设置 (作用于整个列表) ")
         right.setMinimumWidth(250)
@@ -346,11 +486,13 @@ class BatchPrinterApp(QMainWindow):
         known = all_known_exts(ext_map)
         if os.path.isdir(path):
             if recursive:
-                for root, _dirs, files in os.walk(path):
-                    for f in sorted(files):
+                for root, dirs, files in os.walk(path):
+                    # 子文件夹按资源管理器顺序遍历 (原地排序决定 os.walk 顺序)
+                    dirs[:] = sort_names(dirs)
+                    for f in sort_names(files):
                         self.enqueue_path(os.path.join(root, f), recursive=False)
             else:
-                for f in sorted(os.listdir(path)):
+                for f in sort_names(os.listdir(path)):
                     full = os.path.join(path, f)
                     if os.path.isfile(full):
                         self.enqueue_path(full, recursive=False)
@@ -370,8 +512,10 @@ class BatchPrinterApp(QMainWindow):
 
     def _add_item(self, path, cat, temp_root=None):
         self._seq += 1
+        self._added_seq += 1
         item = {"path": path, "type": cat, "copies": None, "color": None,
-                "duplex": None, "pages": None, "status": STATUS_QUEUED, "temp_root": temp_root}
+                "duplex": None, "pages": None, "status": STATUS_QUEUED,
+                "temp_root": temp_root, "added": self._added_seq}
         self.items.append(item)
         r = self.table.rowCount()
         self.table.insertRow(r)
@@ -392,7 +536,7 @@ class BatchPrinterApp(QMainWindow):
         ext_map = self._ext_map()
         known = all_known_exts(ext_map)
         added = 0
-        for f in sorted(files):
+        for f in sort_names(files):
             ext = os.path.splitext(f)[1].lower().lstrip(".")
             if ("." + ext) in known:
                 self._add_item(f, resolve_category(ext, ext_map) or "?", temp_root=dest)
@@ -400,73 +544,335 @@ class BatchPrinterApp(QMainWindow):
         self._log(f"压缩包 {os.path.basename(arc_path)}: 解压出 {len(files)} 个文件, "
                   f"其中 {added} 个加入打印队列")
 
+    # ------------------------------------------------------------ 顺序调整
+
+    def _printing(self):
+        return bool(self.print_thread and self.print_thread.is_alive())
+
+    def _apply_reorder(self, src_rows, dst_row):
+        """把 src_rows 这些行整体移动到 dst_row 位置 (拖动/上移下移共用)"""
+        if self._printing():
+            self._log("⚠ 打印进行中, 暂不能调整顺序 (停止后可调)")
+            return
+        n = len(self.items)
+        src = [r for r in src_rows if 0 <= r < n]
+        if not src or n < 2:
+            return
+        moving = [self.items[r] for r in src]
+        src_set = set(src)
+        rest = [it for i, it in enumerate(self.items) if i not in src_set]
+        insert = dst_row - sum(1 for r in src if r < dst_row)
+        insert = max(0, min(insert, len(rest)))
+        new_items = rest[:insert] + moving + rest[insert:]
+        if [id(x) for x in new_items] == [id(x) for x in self.items]:
+            return                                    # 位置没变
+        self.items = new_items
+        self._rebuild_table()
+        self.table.clearSelection()
+        for r in range(insert, insert + len(moving)):
+            self.table.setRangeSelected(
+                QTableWidgetSelectionRange(r, 0, r, len(COLS) - 1), True)
+        self.table.scrollToItem(self.table.item(insert, C_NAME))
+        self._log(f"顺序已调整: {len(moving)} 个文件移到第 {insert + 1} 位")
+
+    def move_selected(self, delta):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        if not rows:
+            self._log("请先选中要移动的行")
+            self.drag_hint.setText("⚠ 请先在列表中选中要移动的行, 再点 上移/下移")
+            return
+        if delta < 0:
+            if rows[0] == 0:
+                return
+            self._apply_reorder(rows, rows[0] - 1)
+        else:
+            if rows[-1] >= len(self.items) - 1:
+                return
+            self._apply_reorder(rows, rows[-1] + 2)
+
+    def sort_by_name(self):
+        self.apply_sort("name")
+
+    def sort_by_added(self):
+        self.apply_sort("added")
+
+    def _on_sort_changed(self, text):
+        mode = SORT_MODES.get(text, "added")
+        if not self.apply_sort(mode):
+            # 未能生效 (打印中/列表不足), 回到上一个选择
+            self.sort_combo.blockSignals(True)
+            self.sort_combo.setCurrentText(self._last_sort_label)
+            self.sort_combo.blockSignals(False)
+
+    def apply_sort(self, mode):
+        """按指定方式重排整个列表, 返回是否生效"""
+        if self._printing():
+            self._log("⚠ 打印进行中, 暂不能调整顺序")
+            return False
+        if mode == "added":
+            self._last_sort_label = "添加顺序"
+        elif mode == "name":
+            self._last_sort_label = "文件名 (A→Z)"
+        elif mode == "mtime_asc":
+            self._last_sort_label = "修改时间 (早→晚)"
+        else:
+            self._last_sort_label = "修改时间 (晚→早)"
+        if len(self.items) < 2:
+            return True
+        if mode == "added":
+            self.items.sort(key=lambda it: it.get("added", 0))
+            tip = "按添加顺序"
+        elif mode == "name":
+            self.items.sort(key=cmp_to_key(
+                lambda a, b: natural_cmp(os.path.basename(a["path"]),
+                                         os.path.basename(b["path"]))))
+            tip = "按文件名 (资源管理器顺序)"
+        elif mode == "mtime_asc":
+            self.items.sort(key=lambda it: (file_mtime(it["path"]),
+                                            os.path.basename(it["path"]).lower()))
+            tip = "按修改时间 早→晚"
+        else:
+            self.items.sort(key=lambda it: (file_mtime(it["path"]),
+                                            os.path.basename(it["path"]).lower()),
+                            reverse=True)
+            tip = "按修改时间 晚→早"
+        self._rebuild_table()
+        self._log(f"已{tip}重排列表 ({len(self.items)} 项)")
+        return True
+
+    def _rebuild_table(self):
+        """按 self.items 重绘整个表格 (行号重排为 1..n)"""
+        self.table.setRowCount(0)
+        for i, item in enumerate(self.items):
+            self.table.insertRow(i)
+            vals = [
+                str(i + 1),
+                os.path.basename(item["path"]),
+                item["type"],
+                "全局" if item["copies"] is None else str(item["copies"]),
+                "全局" if not item["color"] else COLOR_LABELS.get(item["color"], item["color"]),
+                "全局" if not item["duplex"] else DUPLEX_LABELS.get(item["duplex"], item["duplex"]),
+                "全局" if not item["pages"] else item["pages"],
+                item["status"],
+            ]
+            for c, v in enumerate(vals):
+                it = QTableWidgetItem(str(v))
+                if c in (C_COPIES, C_PAGES):
+                    it.setTextAlignment(Qt.AlignCenter)
+                if c == C_STATUS:
+                    col = STATUS_COLORS.get(item["status"])
+                    if col:
+                        it.setForeground(QColor(col))
+                self.table.setItem(i, c, it)
+        self._seq = len(self.items)
+
     def remove_selected(self):
         rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
+        if not rows:
+            return
         for r in rows:
-            self.table.removeRow(r)
-            self.items.pop(r)
+            if 0 <= r < len(self.items):
+                self.items.pop(r)
+        self._rebuild_table()
+        self._log(f"已移除 {len(rows)} 项")
 
     def clear_list(self):
         self.table.setRowCount(0)
         self.items.clear()
+        self._seq = 0
+        self._added_seq = 0
 
-    # ------------------------------------------------------------ 个体设置
+    # ------------------------------------------------------------ 个体/批量设置
 
-    def edit_item_settings(self):
-        idx = self.table.currentRow()
-        if idx < 0 or idx >= len(self.items):
+    def selected_rows(self):
+        return sorted({i.row() for i in self.table.selectedIndexes()})
+
+    def _on_double_click(self, *_):
+        self.batch_settings(self.selected_rows())
+
+    def _table_menu(self, pos):
+        rows = self.selected_rows()
+        m = QMenu(self)
+        n = len(rows)
+        act_set = m.addAction(f"⚙ 批量设置选中的 {n} 个文件" if n > 1 else "⚙ 设置此文件")
+        act_set.triggered.connect(lambda: self.batch_settings(rows))
+        m.addSeparator()
+        act_up = m.addAction("↑ 上移")
+        act_up.triggered.connect(lambda: self.move_selected(-1))
+        act_up.setEnabled(bool(rows))
+        act_dn = m.addAction("↓ 下移")
+        act_dn.triggered.connect(lambda: self.move_selected(1))
+        act_dn.setEnabled(bool(rows))
+        m.addSeparator()
+        sm = m.addMenu("排序")
+        for label, key in SORT_MODES.items():
+            a = sm.addAction(label)
+            a.triggered.connect(lambda _=False, k=key: self.apply_sort(k))
+        m.addSeparator()
+        act_del = m.addAction(f"移除选中的 {n} 项" if n > 1 else "移除此文件")
+        act_del.triggered.connect(self.remove_selected)
+        act_del.setEnabled(bool(rows))
+        m.exec(self.table.viewport().mapToGlobal(pos))
+
+    def batch_settings(self, rows=None, *args):
+        """对多个选中的文件统一设置打印参数 (留空/选"不修改"则保持原值)"""
+        # 按钮的 clicked 信号会附带 checked(bool) 参数, 这里统一过滤掉
+        if rows is not None and not isinstance(rows, (list, tuple, set)):
+            rows = None
+        rows = self.selected_rows() if rows is None else sorted(rows)
+        rows = [r for r in rows if 0 <= r < len(self.items)]
+        if not rows:
+            QMessageBox.information(
+                self, "提示",
+                "请先在列表中选中要设置的文件。\n可按住 Ctrl 逐个点选, 或 Shift 选择连续多行。")
             return
-        item = self.items[idx]
+        single = len(rows) == 1
         d = QDialog(self)
-        d.setWindowTitle("单文件打印设置")
+        d.setWindowTitle("单文件打印设置" if single else f"批量设置 ({len(rows)} 个文件)")
         d.setModal(True)
+        d.setMinimumWidth(430)
         g = QGridLayout(d)
         g.setVerticalSpacing(8)
 
-        name = QLabel(os.path.basename(item["path"]))
-        name.setStyleSheet("font-weight:bold;")
-        g.addWidget(name, 0, 0, 1, 2)
+        head = QLabel(os.path.basename(self.items[rows[0]]["path"]) if single
+                      else f"将对选中的 {len(rows)} 个文件统一应用以下设置")
+        head.setStyleSheet("font-weight:bold;")
+        head.setWordWrap(True)
+        g.addWidget(head, 0, 0, 1, 2)
 
-        g.addWidget(QLabel("份数 (留空=跟随全局):"), 1, 0)
-        copies_e = QLineEdit("" if item["copies"] is None else str(item["copies"]))
-        g.addWidget(copies_e, 1, 1)
+        def common(key):
+            """所有选中项取值一致时返回该值, 否则返回 None"""
+            vals = {self.items[r][key] for r in rows}
+            return vals.pop() if len(vals) == 1 else None
 
-        g.addWidget(QLabel("色彩模式:"), 2, 0)
+        def describe(key, labels, default):
+            """当前选中的所有文件在该项上的取值摘要"""
+            vals = {self.items[r][key] for r in rows}
+            if len(vals) > 1:
+                return "各不相同"
+            v = vals.pop()
+            if key == "copies":
+                return default if v is None else f"{v} 份"
+            if key == "pages":
+                return default if not v else v
+            return labels.get(v or "", default)
+
+        if not single:
+            lab = QLabel("这些文件当前: " + ", ".join([
+                "份数=" + describe("copies", COLOR_LABELS, "跟随全局"),
+                "色彩=" + describe("color", COLOR_LABELS, "跟随打印机"),
+                "双面=" + describe("duplex", DUPLEX_LABELS, "跟随打印机"),
+                "页码=" + describe("pages", COLOR_LABELS, "全局"),
+            ]))
+            lab.setStyleSheet("color:#666;font-size:11px;")
+            lab.setWordWrap(True)
+            g.addWidget(lab, 1, 0, 1, 2)
+
+        base = 2 if not single else 1
+
+        # 份数 (多选时一律留空=不修改)
+        g.addWidget(QLabel("份数:"), base, 0)
+        c_val = common("copies") if single else None
+        copies_e = QLineEdit("" if c_val is None else str(c_val))
+        copies_e.setPlaceholderText("不修改" if not single else "留空=跟随全局")
+        g.addWidget(copies_e, base, 1)
+
+        # 色彩
+        g.addWidget(QLabel("色彩模式:"), base + 1, 0)
+        color_labels = ["不修改"] + list(COLOR_LABELS.values())
         color_c = QComboBox()
-        color_c.addItems(["跟随全局"] + list(COLOR_LABELS.values()))
-        color_c.setCurrentText(COLOR_LABELS.get(item["color"] or "", "跟随全局"))
-        g.addWidget(color_c, 2, 1)
+        color_c.addItems(color_labels)
+        if single:
+            color_c.removeItem(0)
+            color_c.setCurrentText(COLOR_LABELS.get(self.items[rows[0]]["color"] or "",
+                                                    "跟随打印机"))
+        g.addWidget(color_c, base + 1, 1)
 
-        g.addWidget(QLabel("双面/单面:"), 3, 0)
+        # 双面
+        g.addWidget(QLabel("双面/单面:"), base + 2, 0)
+        duplex_labels = ["不修改"] + list(DUPLEX_LABELS.values())
         duplex_c = QComboBox()
-        duplex_c.addItems(["跟随全局"] + list(DUPLEX_LABELS.values()))
-        duplex_c.setCurrentText(DUPLEX_LABELS.get(item["duplex"] or "", "跟随全局"))
-        g.addWidget(duplex_c, 3, 1)
+        duplex_c.addItems(duplex_labels)
+        if single:
+            duplex_c.removeItem(0)
+            duplex_c.setCurrentText(DUPLEX_LABELS.get(self.items[rows[0]]["duplex"] or "",
+                                                      "跟随打印机"))
+        g.addWidget(duplex_c, base + 2, 1)
 
-        g.addWidget(QLabel("页码范围 (留空=跟随全局):"), 4, 0)
-        pages_e = QLineEdit(item["pages"] or "")
-        g.addWidget(pages_e, 4, 1)
+        # 页码范围
+        g.addWidget(QLabel("页码范围:"), base + 3, 0)
+        p_val = common("pages") if single else None
+        pages_e = QLineEdit("" if p_val is None else p_val)
+        pages_e.setPlaceholderText("不修改, 如 1-3,5" if not single else "留空=跟随全局")
+        g.addWidget(pages_e, base + 3, 1)
+
+        reset_chk = None
+        if not single:
+            reset_chk = QCheckBox("先清除这些文件已有的单独设置 (全部改为跟随全局)")
+            g.addWidget(reset_chk, base + 4, 0, 1, 2)
+        tip = QLabel("留空或选「不修改」= 保持文件原有设置; 选「跟随打印机」= 用打印机默认参数")
+        tip.setStyleSheet("color:#888;font-size:11px;")
+        tip.setWordWrap(True)
+        g.addWidget(tip, base + 5, 0, 1, 2)
+
+        box = QHBoxLayout()
+        ok_b = QPushButton("确定")
+        ok_b.setDefault(True)
+        cancel_b = QPushButton("取消")
+        box.addStretch()
+        box.addWidget(ok_b)
+        box.addWidget(cancel_b)
+        g.addLayout(box, base + 6, 0, 1, 2)
+        cancel_b.clicked.connect(d.reject)
 
         def save():
-            c = copies_e.text().strip()
-            try:
-                item["copies"] = int(float(c)) if c else None
-            except ValueError:
-                item["copies"] = None
-            item["color"] = "" if color_c.currentText() == "跟随全局" \
-                else COLOR_LABEL2VAL.get(color_c.currentText(), None)
-            item["duplex"] = "" if duplex_c.currentText() == "跟随全局" \
-                else DUPLEX_LABEL2VAL.get(duplex_c.currentText(), None)
-            item["pages"] = pages_e.text().strip() or None
-            self.table.item(idx, C_COPIES).setText("全局" if item["copies"] is None else str(item["copies"]))
-            self.table.item(idx, C_COLOR).setText("全局" if not item["color"] else COLOR_LABELS[item["color"]])
-            self.table.item(idx, C_DUPLEX).setText("全局" if not item["duplex"] else DUPLEX_LABELS[item["duplex"]])
-            self.table.item(idx, C_PAGES).setText("全局" if not item["pages"] else item["pages"])
+            copies_txt = copies_e.text().strip()
+            copies = None
+            if copies_txt:
+                try:
+                    copies = int(float(copies_txt))
+                    if copies < 1:
+                        raise ValueError
+                except ValueError:
+                    QMessageBox.warning(d, "份数无效", "份数请填 1 以上的整数, 或留空不修改")
+                    return
+            pages_txt = pages_e.text().strip()
+            if pages_txt:
+                try:
+                    if not parse_page_range(pages_txt):
+                        raise ValueError
+                except Exception:
+                    QMessageBox.warning(d, "页码范围无效",
+                                        "页码范围格式如 1-3,5,8。\n留空则不修改。")
+                    return
+            color_txt = color_c.currentText()
+            duplex_txt = duplex_c.currentText()
+            changed = 0
+            for r in rows:
+                it = self.items[r]
+                if reset_chk is not None and reset_chk.isChecked():
+                    it.update({"copies": None, "color": "", "duplex": "",
+                               "pages": None})
+                if copies is not None:
+                    it["copies"] = copies
+                if color_txt != "不修改":
+                    it["color"] = COLOR_LABEL2VAL.get(color_txt, "")
+                if duplex_txt != "不修改":
+                    it["duplex"] = DUPLEX_LABEL2VAL.get(duplex_txt, "")
+                if pages_txt:
+                    it["pages"] = pages_txt
+                changed += 1
+            self._rebuild_table()
+            for r in rows:
+                self.table.setRangeSelected(
+                    QTableWidgetSelectionRange(r, 0, r, len(COLS) - 1), True)
+            self._log(f"已设置 {changed} 个文件: "
+                      f"份数={'不修改' if copies is None else copies}, "
+                      f"色彩={color_txt}, 双面={duplex_txt}, "
+                      f"页码={pages_txt or '不修改'}")
             d.accept()
 
-        save_b = QPushButton("保存")
-        save_b.clicked.connect(save)
-        g.addWidget(save_b, 5, 0, 1, 2)
+        ok_b.clicked.connect(save)
         d.exec()
 
     # ------------------------------------------------------------ 扩展名映射
@@ -577,26 +983,30 @@ class BatchPrinterApp(QMainWindow):
 
         def work():
             sig = self.sig
-            for idx, item in enumerate(items_snapshot):
-                if self.cancel_event.is_set():
-                    sig.status.emit(idx, "已取消")
-                    continue
-                sig.status.emit(idx, "打印中")
-                opts = {
-                    "copies": item["copies"] if item["copies"] is not None else (g["copies"] or None),
-                    "color": item["color"] or g["color"] or None,
-                    "duplex": item["duplex"] or g["duplex"] or None,
-                    "pages": item["pages"] or g["pages"] or None,
-                }
-                try:
-                    print_file(item["path"], printer, opts, ext_map, sumatra,
-                               lambda m: sig.log.emit("  " + m))
-                    sig.status.emit(idx, "已发送")
-                except Exception as e:
-                    sig.log.emit(f"❌ {os.path.basename(item['path'])}: {e}")
-                    sig.status.emit(idx, "失败")
-                if interval > 0:
-                    self.cancel_event.wait(interval)
+            # 整批打印期间把系统默认打印机切到所选打印机, 结束后恢复。
+            # 没有这一步, Office/未知格式的 Shell 打印永远只会打到默认打印机。
+            guard_log = lambda m: sig.log.emit(m)  # noqa: E731
+            with default_printer_guard(printer, guard_log):
+                for idx, item in enumerate(items_snapshot):
+                    if self.cancel_event.is_set():
+                        sig.status.emit(idx, "已取消")
+                        continue
+                    sig.status.emit(idx, "打印中")
+                    opts = {
+                        "copies": item["copies"] if item["copies"] is not None else (g["copies"] or None),
+                        "color": item["color"] or g["color"] or None,
+                        "duplex": item["duplex"] or g["duplex"] or None,
+                        "pages": item["pages"] or g["pages"] or None,
+                    }
+                    try:
+                        print_file(item["path"], printer, opts, ext_map, sumatra,
+                                   lambda m: sig.log.emit("  " + m))
+                        sig.status.emit(idx, "已发送")
+                    except Exception as e:
+                        sig.log.emit(f"❌ {os.path.basename(item['path'])}: {e}")
+                        sig.status.emit(idx, "失败")
+                    if interval > 0:
+                        self.cancel_event.wait(interval)
             sig.done.emit()
 
         self.print_thread = threading.Thread(target=work, daemon=True)
