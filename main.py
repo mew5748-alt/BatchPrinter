@@ -36,6 +36,7 @@ from printer_core import (
     list_printers, get_default_printer, find_sumatra, print_file,
     resolve_category, all_known_exts, parse_page_range,
     default_printer_guard, get_default_printer_name,
+    list_paper_sizes, list_paper_bins,
 )
 from archive_util import extract_archive, cleanup_dir, is_archive
 
@@ -43,7 +44,7 @@ APP_NAME = "BatchPrinter"
 PREVIEW_MIN_W = 240          # 预览列最窄
 PREVIEW_DEFAULT_W = 330      # 默认宽度
 PREVIEW_MAX_W = 620          # 最宽
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
@@ -90,7 +91,8 @@ DEFAULT_LAYOUT_CFG = {
 
 DEFAULT_CONFIG = {
     "printer": "",
-    "global": {"copies": 1, "color": "", "duplex": "", "pages": ""},
+    "global": {"copies": 1, "color": "", "duplex": "", "pages": "",
+               "paper": 0, "source": 0, "per_page": False, "page_gap": 0.5},
     "layout": dict(DEFAULT_LAYOUT_CFG),
     "office_com": True,
     "subfolders": True,
@@ -361,6 +363,7 @@ class BatchPrinterApp(QMainWindow):
         self.sig.done.connect(self._on_done)
 
         self._build_ui()
+        self._init_paper_ui()
         self.refresh_printers()
         self._refresh_sumatra_label()
         self._sync_layout_ui()
@@ -497,10 +500,22 @@ class BatchPrinterApp(QMainWindow):
         rv.setContentsMargins(0, 0, 0, 0)
         rv.setSpacing(6)
 
+        # 设置项放进滚动区: 小屏幕 / 高 DPI 下按钮永远够得着, 不会被裁掉
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setFrameShape(QFrame.NoFrame)
+        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.settings_scroll.setStyleSheet("QScrollArea{background:transparent;}")
+        settings_host = QWidget()
+        rv_inner = QVBoxLayout(settings_host)
+        rv_inner.setContentsMargins(0, 0, 2, 0)
+        rv_inner.setSpacing(6)
+        self.settings_scroll.setWidget(settings_host)
+
         # ---- 打印参数
         g1 = QGroupBox(" 打印参数 (作用于整个列表) ")
         g = QGridLayout(g1)
-        g.setVerticalSpacing(8)
+        g.setVerticalSpacing(6)
 
         g.addWidget(QLabel("份数:"), 0, 0)
         self.g_copies = QSpinBox()
@@ -524,7 +539,38 @@ class BatchPrinterApp(QMainWindow):
         self.g_pages = QLineEdit(self.cfg["global"].get("pages", ""))
         self.g_pages.setPlaceholderText("如 1-3,5 留空=全部")
         g.addWidget(self.g_pages, 3, 1)
-        rv.addWidget(g1)
+
+        # 纸型 (按纸型缩放) / 纸张来源 (进纸盒), 选项来自打印机驱动
+        g.addWidget(QLabel("纸型:"), 4, 0)
+        self.g_paper = QComboBox()
+        self.g_paper.setToolTip("按纸型缩放: 内容自动缩放到该纸型的可打印区域\n"
+                                "例如 A4 的文档选 A3 → 放大铺满 A3; 选 A5 → 缩到 A5\n"
+                                "选项由打印机驱动提供, 留空/跟随 = 用打印机当前纸型")
+        g.addWidget(self.g_paper, 4, 1)
+
+        g.addWidget(QLabel("纸张来源:"), 5, 0)
+        self.g_source = QComboBox()
+        self.g_source.setToolTip("从哪个进纸盒/手送盘取纸 (纸盘1、纸盘2、手送纸盘…)\n"
+                                 "选项由打印机驱动提供, 跟随打印机 = 用驱动当前设置")
+        g.addWidget(self.g_source, 5, 1)
+
+        # 逐页打印: 每页一个独立作业, 页与页之间可停一会儿
+        self.g_per_page = QCheckBox("逐页打印")
+        self.g_per_page.setToolTip(
+            "把每一页单独作为一个打印作业发送, 而不是整份一次发完。\n"
+            "适合: 手动放纸/翻面、逐页核对、卡纸后按页补打、想让打印机一页一页出。\n"
+            "代价: 页数多时打印速度略慢 (每页都要和打印机交互一次)")
+        g.addWidget(self.g_per_page, 6, 0)
+
+        self.g_gap = QDoubleSpinBox()
+        self.g_gap.setRange(0.0, 60.0)
+        self.g_gap.setSingleStep(0.5)
+        self.g_gap.setDecimals(1)
+        self.g_gap.setSuffix(" 秒/页")
+        self.g_gap.setToolTip("逐页打印时, 每页之间等待多久再发下一页\n"
+                              "0 = 不等待 (连续发); 手动翻纸时可设 3~5 秒")
+        g.addWidget(self.g_gap, 6, 1)
+        rv_inner.addWidget(g1)
 
         # ---- 版面设置 (只影响打印, 不改原文件)
         g2 = QGroupBox(" 版面设置 (Word / Excel) ")
@@ -545,7 +591,7 @@ class BatchPrinterApp(QMainWindow):
         self.engine_lbl.setStyleSheet("color:#888;font-size:11px;")
         self.engine_lbl.setWordWrap(True)
         lv2.addWidget(self.engine_lbl)
-        rv.addWidget(g2)
+        rv_inner.addWidget(g2)
 
         # ---- 其他
         g3 = QGroupBox(" 其他 ")
@@ -568,12 +614,13 @@ class BatchPrinterApp(QMainWindow):
         browse.clicked.connect(self._browse_sumatra)
         sw.addWidget(browse)
         g3g.addLayout(sw, 2, 1)
-        hint = QLabel("PDF 静默打印推荐安装,\n留空自动搜索")
+        hint = QLabel("推荐安装, 留空自动搜索")
         hint.setStyleSheet("color:#888;font-size:11px;")
         g3g.addWidget(hint, 3, 0, 1, 2)
-        rv.addWidget(g3)
+        rv_inner.addWidget(g3)
 
-        rv.addStretch(1)
+        rv_inner.addStretch(1)
+        rv.addWidget(self.settings_scroll, 1)
         self.print_btn = QPushButton("🖨 立即打印全部")
         self.print_btn.setMinimumHeight(40)
         self.print_btn.setStyleSheet("font-weight:bold;font-size:14px;")
@@ -602,7 +649,7 @@ class BatchPrinterApp(QMainWindow):
         lv = QVBoxLayout(logg)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(110)
+        self.log_text.setMaximumHeight(100)
         self.log_text.setStyleSheet("font-family:Consolas,monospace;font-size:12px;")
         lv.addWidget(self.log_text)
         root.addWidget(logg)
@@ -630,6 +677,10 @@ class BatchPrinterApp(QMainWindow):
             "color": COLOR_LABEL2VAL.get(self.g_color.currentText(), ""),
             "duplex": DUPLEX_LABEL2VAL.get(self.g_duplex.currentText(), ""),
             "pages": self.g_pages.text().strip(),
+            "paper": self.current_paper()[0],
+            "source": self.current_source()[0],
+            "per_page": self.g_per_page.isChecked(),
+            "page_gap": round(float(self.g_gap.value()), 2),
         }
         self.cfg["subfolders"] = self.subfolder_chk.isChecked()
         self.cfg["layout"] = dict(self.cfg.get("layout") or DEFAULT_LAYOUT_CFG)
@@ -824,14 +875,20 @@ class BatchPrinterApp(QMainWindow):
 
     def _opts_for_item(self, item):
         g = self.cfg["global"]
-        return {
+        paper, _paper_txt = self.current_paper()
+        source, _src_txt = self.current_source()
+        opts = {
             "copies": item["copies"] if item["copies"] is not None else (g["copies"] or None),
             "color": item["color"] or g["color"] or None,
             "duplex": item["duplex"] or g["duplex"] or None,
             "pages": item["pages"] or g["pages"] or None,
             "layout": self.layout_opts(),
             "office_com": bool(self.cfg.get("office_com", True)),
+            "paper": paper,
+            "source": source,
         }
+        opts.update(self.print_extras())
+        return opts
 
     def _print_from_preview(self, path, opts):
         """预览面板里点「打印此文件」"""
@@ -873,17 +930,109 @@ class BatchPrinterApp(QMainWindow):
     def refresh_printers(self):
         ps = list_printers()
         default = get_default_printer()
-        self.printer_combo.clear()
-        for p in ps:
-            self.printer_combo.addItem(p + ("  (默认)" if p == default else ""))
-        saved = self.cfg.get("printer", "")
-        for p in ps:
-            if p == saved:
-                self.printer_combo.setCurrentText(p + ("  (默认)" if p == default else ""))
-                break
-        else:
-            if default:
-                self.printer_combo.setCurrentText(default + "  (默认)")
+        self._filling_printers = True          # 重建列表期间别触发纸型重新枚举
+        try:
+            self.printer_combo.clear()
+            for p in ps:
+                self.printer_combo.addItem(p + ("  (默认)" if p == default else ""))
+            saved = self.cfg.get("printer", "")
+            for p in ps:
+                if p == saved:
+                    self.printer_combo.setCurrentText(p + ("  (默认)" if p == default else ""))
+                    break
+            else:
+                if default:
+                    self.printer_combo.setCurrentText(default + "  (默认)")
+        finally:
+            self._filling_printers = False
+        self.refresh_paper_choices()
+
+    # ------------------------------------------------------------ 纸型 / 纸张来源
+
+    def _init_paper_ui(self):
+        g = self.cfg["global"]
+        self.g_per_page.setChecked(bool(g.get("per_page", False)))
+        self.g_gap.setValue(max(0.0, float(g.get("page_gap") or 0.0)))
+        self.g_per_page.toggled.connect(self._sync_per_page)
+        self.printer_combo.currentTextChanged.connect(self._on_printer_changed)
+        self._sync_per_page()
+
+    def _sync_per_page(self, *_):
+        self.g_gap.setEnabled(self.g_per_page.isChecked())
+
+    def _printer_caps(self):
+        """当前打印机支持的 (纸型列表, 纸盒列表), 按打印机缓存 (枚举一次要几十毫秒)"""
+        printer = self.current_printer()
+        cache = getattr(self, "_caps_cache", None)
+        if cache is None:
+            cache = self._caps_cache = {}
+        if printer not in cache:
+            cache[printer] = (list_paper_sizes(printer), list_paper_bins(printer))
+        return cache[printer]
+
+    @staticmethod
+    def _combo_data(combo):
+        try:
+            return int(combo.currentData() or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _paper_text(name, w, h):
+        """纸型显示名: 驱动自带的名字里没有尺寸时补上 宽×高"""
+        name = (name or "").strip()
+        if not name:
+            return "未命名纸型"
+        low = name.lower()
+        if not w or not h or "mm" in low or "毫米" in name or "英寸" in name or "×" in name:
+            return name
+        return f"{name} ({w}×{h}mm)"
+
+    def refresh_paper_choices(self):
+        """按当前打印机重建 纸型/纸张来源 下拉, 尽量保留已选的值"""
+        if not hasattr(self, "g_paper"):
+            return
+        papers, bins = self._printer_caps()
+        g = self.cfg["global"]
+        want_paper = self._combo_data(self.g_paper) or int(g.get("paper") or 0)
+        want_src = self._combo_data(self.g_source) or int(g.get("source") or 0)
+
+        self.g_paper.blockSignals(True)
+        self.g_paper.clear()
+        self.g_paper.addItem("跟随打印机", 0)
+        for pid, name, w, h in papers:
+            self.g_paper.addItem(self._paper_text(name, w, h), pid)
+        idx = self.g_paper.findData(want_paper)
+        self.g_paper.setCurrentIndex(idx if idx >= 0 else 0)
+        self.g_paper.blockSignals(False)
+        self.g_paper.setEnabled(self.g_paper.count() > 1)
+
+        self.g_source.blockSignals(True)
+        self.g_source.clear()
+        self.g_source.addItem("跟随打印机", 0)
+        for bid, name in bins:
+            self.g_source.addItem(name, bid)
+        idx = self.g_source.findData(want_src)
+        self.g_source.setCurrentIndex(idx if idx >= 0 else 0)
+        self.g_source.blockSignals(False)
+        self.g_source.setEnabled(self.g_source.count() > 1)
+
+    def _on_printer_changed(self, *_):
+        if getattr(self, "_filling_printers", False):
+            return
+        self.refresh_paper_choices()
+
+    def current_paper(self):
+        """(纸型ID, 纸型显示名); ID 0 = 跟随打印机"""
+        return self._combo_data(self.g_paper), self.g_paper.currentText()
+
+    def current_source(self):
+        return self._combo_data(self.g_source), self.g_source.currentText()
+
+    def print_extras(self):
+        """逐页打印相关设置"""
+        return {"per_page": self.g_per_page.isChecked(),
+                "page_gap": float(self.g_gap.value()) if self.g_per_page.isChecked() else 0.0}
 
     def current_printer(self):
         return self.printer_combo.currentText().replace("  (默认)", "").strip()
@@ -1419,6 +1568,9 @@ class BatchPrinterApp(QMainWindow):
         items_snapshot = list(self.items)
         layout = self.layout_opts()
         office_com = bool(self.cfg.get("office_com", True))
+        paper, paper_txt = self.current_paper()
+        source, source_txt = self.current_source()
+        extras = self.print_extras()
 
         self.cancel_event.clear()
         self.print_btn.setEnabled(False)
@@ -1427,6 +1579,12 @@ class BatchPrinterApp(QMainWindow):
         lay_txt = office_core.layout_summary(layout)
         if lay_txt:
             self._log(f"版面设置: {lay_txt}")
+        if paper:
+            self._log(f"纸型: {paper_txt} (内容按纸型缩放)")
+        if source:
+            self._log(f"纸张来源: {source_txt}")
+        if extras["per_page"]:
+            self._log(f"逐页打印: 每页一个作业, 页间等待 {extras['page_gap']:g} 秒")
         if office_com:
             self._log("Office 文件使用静默打印 (COM 转 PDF 后发送, 不会弹出程序窗口)")
 
@@ -1449,7 +1607,10 @@ class BatchPrinterApp(QMainWindow):
                             "pages": item["pages"] or g["pages"] or None,
                             "layout": layout,
                             "office_com": office_com,
+                            "paper": paper,
+                            "source": source,
                         }
+                        opts.update(extras)
                         try:
                             print_file(item["path"], printer, opts, ext_map, sumatra,
                                        lambda m: sig.log.emit("  " + m))
