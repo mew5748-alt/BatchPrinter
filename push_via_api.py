@@ -41,7 +41,8 @@ def req(method, url, data=None, raw=False, retries=4):
 def main():
     root = os.path.dirname(os.path.abspath(__file__))
     files = ["main.py", "printer_core.py", "archive_util.py", "setup_main.py",
-             "gen_installer.py", "test_core.py", "README.md", "LICENSE",
+             "gen_installer.py", "test_core.py", "test_printer_target.py",
+             "README.md", "LICENSE",
              ".gitignore", "SHA256SUMS.txt", "app.ico", "push_via_api.py"]
 
     # 仓库是否为空 (无 main 分支)
@@ -78,8 +79,8 @@ def main():
     print("tree:", t["sha"][:10])
 
     # 3. commit
-    commit_data = {"message": "BatchPrinter v1.0: Windows batch printing tool "
-                              "(PDF/archive/folder batch printing, global & per-file settings, extension mapping)",
+    commit_data = {"message": "v1.0.2: fix selected printer being ignored; drag reorder, "
+                              "name/mtime sorting, multi-select batch settings, natural sort",
                    "tree": t["sha"]}
     if base_sha:
         commit_data["parents"] = [base_sha]

@@ -19,16 +19,17 @@ import tempfile
 import shutil
 from functools import cmp_to_key
 
-from PySide6.QtCore import Qt, QObject, Signal
-from PySide6.QtGui import QColor, QAction
+from PySide6.QtCore import Qt, QObject, Signal, QSize
+from PySide6.QtGui import QColor, QAction, QPixmap, QImage, QPainter, QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QComboBox, QLabel, QTableWidget, QTableWidgetItem, QSpinBox,
     QCheckBox, QLineEdit, QTextEdit, QFileDialog, QMessageBox, QDialog,
     QHeaderView, QAbstractItemView, QGroupBox, QSplitter, QToolBar, QStyle,
-    QTableWidgetSelectionRange, QMenu,
+    QTableWidgetSelectionRange, QMenu, QDoubleSpinBox, QScrollArea, QListWidget,
 )
 
+import office_core
 from printer_core import (
     list_printers, get_default_printer, find_sumatra, print_file,
     resolve_category, all_known_exts, parse_page_range,
@@ -37,7 +38,7 @@ from printer_core import (
 from archive_util import extract_archive, cleanup_dir, is_archive
 
 APP_NAME = "BatchPrinter"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.1.0"
 
 APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
@@ -76,9 +77,17 @@ def sort_names(names):
     """按资源管理器顺序排序文件名列表"""
     return sorted(names, key=cmp_to_key(natural_cmp))
 
+DEFAULT_LAYOUT_CFG = {
+    "margins_on": False, "top": 20.0, "bottom": 20.0, "left": 20.0, "right": 20.0,
+    "orientation": "", "excel_fit": "", "excel_scale": 100,
+    "center": False, "gridlines": False,
+}
+
 DEFAULT_CONFIG = {
     "printer": "",
     "global": {"copies": 1, "color": "", "duplex": "", "pages": ""},
+    "layout": dict(DEFAULT_LAYOUT_CFG),
+    "office_com": True,
     "subfolders": True,
     "interval": 2.0,
     "sumatra_path": "",
@@ -122,6 +131,8 @@ def load_config():
             for k, v in saved.items():
                 if k == "global" and isinstance(v, dict):
                     cfg["global"].update(v)
+                elif k == "layout" and isinstance(v, dict):
+                    cfg["layout"].update(v)
                 else:
                     cfg[k] = v
         except Exception:
@@ -181,6 +192,361 @@ class ReorderTable(QTableWidget):
         ev.accept()
 
 
+FIT_LABELS = {"": "不缩放 (按原表)", "width": "所有列缩到一页宽",
+              "page": "整表缩到一页 (宽+高)", "percent": "按百分比缩放"}
+FIT_LABEL2KEY = {v: k for k, v in FIT_LABELS.items()}
+ORIENT_LABELS = {"": "保持原样", "portrait": "纵向", "landscape": "横向"}
+ORIENT_LABEL2KEY = {v: k for k, v in ORIENT_LABELS.items()}
+
+
+class LayoutDialog(QDialog):
+    """Word/Excel 版面设置 (只作用于打印, 不修改原文件)"""
+
+    def __init__(self, parent, layout, office_com=True):
+        super().__init__(parent)
+        self.setWindowTitle("版面设置 (只影响打印, 不改原文件)")
+        self.setModal(True)
+        self.setMinimumWidth(450)
+        lay = office_core.normalize_layout(layout)
+        v = QVBoxLayout(self)
+        v.setSpacing(8)
+
+        # 页边距
+        m = QGroupBox(" 页边距 (Word 与 Excel 通用) ")
+        mg = QGridLayout(m)
+        self.margins_chk = QCheckBox("自定义页边距")
+        mm = lay["margins_mm"] or (20.0, 20.0, 20.0, 20.0)
+        self.spins = {}
+        for i, (key, label) in enumerate((("top", "上"), ("bottom", "下"),
+                                          ("left", "左"), ("right", "右"))):
+            sp = QDoubleSpinBox()
+            sp.setRange(0, 100)
+            sp.setDecimals(1)
+            sp.setSingleStep(1)
+            sp.setSuffix(" mm")
+            sp.setValue(float(mm[i]))
+            row, col = divmod(i, 2)
+            mg.addWidget(QLabel(label + ":"), row, col * 2)
+            mg.addWidget(sp, row, col * 2 + 1)
+            self.spins[key] = sp
+        mg.addWidget(self.margins_chk, 2, 0, 1, 4)
+        self.margins_chk.setChecked(bool(lay["margins_mm"]))
+        v.addWidget(m)
+
+        # 方向
+        o = QGroupBox(" 纸张方向 ")
+        og = QHBoxLayout(o)
+        self.orient_c = QComboBox()
+        self.orient_c.addItems(list(ORIENT_LABELS.values()))
+        self.orient_c.setCurrentText(ORIENT_LABELS.get(lay["orientation"], "保持原样"))
+        og.addWidget(self.orient_c)
+        og.addStretch()
+        v.addWidget(o)
+
+        # Excel
+        x = QGroupBox(" Excel 排版 ")
+        xg = QGridLayout(x)
+        xg.addWidget(QLabel("缩放方式:"), 0, 0)
+        self.fit_c = QComboBox()
+        self.fit_c.addItems(list(FIT_LABELS.values()))
+        self.fit_c.setCurrentText(FIT_LABELS.get(lay["excel_fit"], FIT_LABELS[""]))
+        self.fit_c.currentTextChanged.connect(self._sync_enabled)
+        xg.addWidget(self.fit_c, 0, 1)
+        xg.addWidget(QLabel("缩放比例:"), 1, 0)
+        self.scale_sp = QSpinBox()
+        self.scale_sp.setRange(10, 400)
+        self.scale_sp.setSuffix(" %")
+        self.scale_sp.setValue(int(lay["excel_scale"] or 100))
+        xg.addWidget(self.scale_sp, 1, 1)
+        self.center_chk = QCheckBox("水平居中")
+        self.center_chk.setChecked(bool(lay["center"]))
+        xg.addWidget(self.center_chk, 2, 0, 1, 2)
+        self.grid_chk = QCheckBox("打印网格线")
+        self.grid_chk.setChecked(bool(lay["gridlines"]))
+        xg.addWidget(self.grid_chk, 3, 0, 1, 2)
+        v.addWidget(x)
+
+        self.office_chk = QCheckBox("Office 文件用静默打印 (不弹程序窗口)")
+        self.office_chk.setChecked(bool(office_com))
+        self.office_chk.setToolTip("关闭后回到系统关联程序打印: 会弹程序窗口, 且无法控制"
+                                   "页边距/缩放, 也不保证打到所选打印机")
+        v.addWidget(self.office_chk)
+
+        tip = QLabel("提示: 这些设置只对打印生效, 不会修改原文件。\n"
+                     "Word 支持页边距/方向; Excel 还支持缩放、居中、网格线。")
+        tip.setStyleSheet("color:#888;font-size:11px;")
+        tip.setWordWrap(True)
+        v.addWidget(tip)
+
+        hb = QHBoxLayout()
+        reset = QPushButton("恢复默认")
+        ok = QPushButton("确定")
+        ok.setDefault(True)
+        cancel = QPushButton("取消")
+        hb.addWidget(reset)
+        hb.addStretch()
+        hb.addWidget(ok)
+        hb.addWidget(cancel)
+        v.addLayout(hb)
+
+        self.margins_chk.toggled.connect(self._sync_enabled)
+        reset.clicked.connect(self._reset)
+        ok.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+        self._sync_enabled()
+
+    def _sync_enabled(self, *_):
+        on = self.margins_chk.isChecked()
+        for sp in self.spins.values():
+            sp.setEnabled(on)
+        self.scale_sp.setEnabled(self.fit_c.currentText() == FIT_LABELS["percent"])
+
+    def _reset(self):
+        self.margins_chk.setChecked(False)
+        for sp in self.spins.values():
+            sp.setValue(20.0)
+        self.orient_c.setCurrentText(ORIENT_LABELS[""])
+        self.fit_c.setCurrentText(FIT_LABELS[""])
+        self.scale_sp.setValue(100)
+        self.center_chk.setChecked(False)
+        self.grid_chk.setChecked(False)
+        self.office_chk.setChecked(True)
+        self._sync_enabled()
+
+    def result_cfg(self):
+        return {
+            "margins_on": self.margins_chk.isChecked(),
+            "top": self.spins["top"].value(),
+            "bottom": self.spins["bottom"].value(),
+            "left": self.spins["left"].value(),
+            "right": self.spins["right"].value(),
+            "orientation": ORIENT_LABEL2KEY.get(self.orient_c.currentText(), ""),
+            "excel_fit": FIT_LABEL2KEY.get(self.fit_c.currentText(), ""),
+            "excel_scale": self.scale_sp.value(),
+            "center": self.center_chk.isChecked(),
+            "gridlines": self.grid_chk.isChecked(),
+        }
+
+
+class PreviewDialog(QDialog):
+    """打印预览: Office/PDF 与真正打印使用同一份 PDF, 图片直接显示"""
+
+    def __init__(self, parent, path, opts, ext_map, printer, sumatra, log=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"打印预览 - {os.path.basename(path)}")
+        self.setModal(True)
+        self.resize(940, 780)
+        self.path = path
+        self.opts = opts or {}
+        self.ext_map = ext_map or {}
+        self.printer = printer
+        self.sumatra = sumatra
+        self.log = log or (lambda m: None)
+        self._pdf = None
+        self._work = None
+        self._images = []
+        self._zoom = 1.0
+        self.page_count = 0
+        self._cur = 0
+        self._build()
+        self._load()
+
+    # -------------------------------------------------- 界面
+    def _build(self):
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("页码:"))
+        self.page_lbl = QLabel("—")
+        self.page_lbl.setStyleSheet("font-weight:bold;")
+        top.addWidget(self.page_lbl)
+        top.addStretch()
+        z_out = QPushButton("－ 缩小")
+        z_in = QPushButton("＋ 放大")
+        fit_b = QPushButton("适合宽度")
+        for b in (z_out, z_in, fit_b):
+            b.setFixedHeight(26)
+            top.addWidget(b)
+        z_out.clicked.connect(lambda: self._zoom_by(-0.25))
+        z_in.clicked.connect(lambda: self._zoom_by(0.25))
+        fit_b.clicked.connect(self._zoom_fit)
+        v.addLayout(top)
+
+        body = QHBoxLayout()
+        self.page_list = QListWidget()
+        self.page_list.setFixedWidth(72)
+        self.page_list.currentRowChanged.connect(self._on_page_changed)
+        body.addWidget(self.page_list)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(False)
+        self.scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        self.canvas = QLabel("正在生成预览…")
+        self.canvas.setAlignment(Qt.AlignCenter)
+        self.canvas.setStyleSheet("background:#5a5a5a;color:#eee;padding:20px;")
+        self.canvas.setMinimumSize(320, 240)
+        self.scroll.setWidget(self.canvas)
+        body.addWidget(self.scroll, 1)
+        v.addLayout(body, 1)
+
+        bottom = QHBoxLayout()
+        self.info = QLabel("")
+        self.info.setStyleSheet("color:#555;font-size:11px;")
+        self.info.setWordWrap(True)
+        bottom.addWidget(self.info, 1)
+        self.print_btn = QPushButton("🖨 打印此文件")
+        self.print_btn.clicked.connect(self._print)
+        close_b = QPushButton("关闭")
+        close_b.clicked.connect(self.accept)
+        bottom.addWidget(self.print_btn)
+        bottom.addWidget(close_b)
+        v.addLayout(bottom)
+
+    # -------------------------------------------------- 生成预览数据
+    def _load(self):
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ext = os.path.splitext(self.path)[1].lower().lstrip(".")
+            ext = self.ext_map.get(ext, ext)
+            cat = resolve_category(ext, self.ext_map)
+            note = ""
+            if cat == "office":
+                pdf, work = office_core.export_pdf(
+                    self.path, self.opts.get("layout"), self.log,
+                    kind=office_core.ext_kind("." + ext))
+                self._work = work
+                self._open_pdf(pdf)
+                note = "Office 转 PDF 预览"
+            elif cat == "pdf":
+                self._open_pdf(self.path)
+                note = "PDF 预览"
+            elif cat == "image":
+                img = QImage(self.path)
+                if img.isNull():
+                    from PIL import Image as PILImage
+                    im = PILImage.open(self.path).convert("RGB")
+                    img = QImage(im.tobytes("raw", "RGB"), im.width, im.height,
+                                 3 * im.width, QImage.Format_RGB888).copy()
+                self._images = [img]
+                self.page_count = 1
+                note = "图片预览"
+            else:
+                raise RuntimeError("该格式暂不支持预览 (文本/RAW 由打印机直接排版)")
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            msg = f"预览生成失败:\n{e}"
+            self.canvas.setText(msg)
+            self.canvas.resize(420, 160)
+            self.info.setText(str(e))
+            self.print_btn.setEnabled(False)
+            return
+        QApplication.restoreOverrideCursor()
+
+        self.page_list.blockSignals(True)
+        self.page_list.clear()
+        for i in range(self.page_count):
+            self.page_list.addItem(str(i + 1))
+        self.page_list.blockSignals(False)
+        self.page_list.setCurrentRow(0)
+        self._show_page(0)
+
+        copies = self.opts.get("copies")
+        lay_txt = office_core.layout_summary(self.opts.get("layout")) or "保持原文件版面"
+        self.info.setText(f"{note} · 共 {self.page_count} 页 · 打印机: {self.printer or '—'}"
+                          f" · 份数: {copies or '打印机默认'} · 版面: {lay_txt}")
+
+    def _open_pdf(self, pdf_path):
+        import pypdfium2 as pdfium
+        self._pdf = pdfium.PdfDocument(pdf_path)
+        self.page_count = len(self._pdf)
+
+    # -------------------------------------------------- 显示
+    def _on_page_changed(self, row):
+        if row >= 0:
+            self._show_page(row)
+
+    def _show_page(self, idx):
+        if not (0 <= idx < self.page_count):
+            return
+        self._cur = idx
+        self.page_lbl.setText(f"{idx + 1} / {self.page_count}")
+        avail = max(320, self.scroll.viewport().width() - 28)
+        try:
+            if self._pdf is not None:
+                page = self._pdf[idx]
+                w, h = page.get_size()
+                scale = (avail / float(w)) * self._zoom
+                pil = page.render(scale=max(0.1, scale)).to_pil()
+                img = QImage(pil.tobytes("raw", "RGB"), pil.width, pil.height,
+                             3 * pil.width, QImage.Format_RGB888).copy()
+                page.close()
+            else:
+                img = self._images[idx]
+                target = int(avail * self._zoom)
+                if img.width() != target:
+                    img = img.scaledToWidth(target, Qt.SmoothTransformation)
+            self.canvas.setPixmap(QPixmap.fromImage(img))
+            self.canvas.resize(img.width() + 16, img.height() + 16)
+        except Exception as e:
+            self.canvas.setText(f"渲染第 {idx + 1} 页失败: {e}")
+
+    def _zoom_by(self, delta):
+        self._zoom = min(3.0, max(0.3, self._zoom + delta))
+        self._show_page(self._cur)
+
+    def _zoom_fit(self):
+        self._zoom = 1.0
+        self._show_page(self._cur)
+
+    # -------------------------------------------------- 打印
+    def _print(self):
+        if not self.printer:
+            QMessageBox.warning(self, "提示", "请先在主界面选择打印机")
+            return
+        self.print_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with default_printer_guard(self.printer, self.log):
+                print_file(self.path, self.printer, self.opts, self.ext_map,
+                           self.sumatra, self.log)
+            self.log(f"已从预览发送打印: {os.path.basename(self.path)}")
+            QMessageBox.information(self, "已发送", "已把该文件发送到打印机。")
+        except Exception as e:
+            QMessageBox.warning(self, "打印失败", str(e))
+        finally:
+            office_core.close_session()
+            QApplication.restoreOverrideCursor()
+            self.print_btn.setEnabled(True)
+
+    def closeEvent(self, e):
+        self._cleanup()
+        e.accept()
+
+    def accept(self):
+        self._cleanup()
+        super().accept()
+
+    def reject(self):
+        self._cleanup()
+        super().reject()
+
+    def _cleanup(self):
+        try:
+            if self._pdf is not None:
+                self._pdf.close()
+                self._pdf = None
+        except Exception:
+            pass
+        if self._work:
+            shutil.rmtree(self._work, ignore_errors=True)
+            self._work = None
+        try:
+            office_core.close_session()      # 预览用完的 Word/Excel 进程一并关掉
+        except Exception:
+            pass
+
+
 class BatchPrinterApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -203,6 +569,8 @@ class BatchPrinterApp(QMainWindow):
         self._build_ui()
         self.refresh_printers()
         self._refresh_sumatra_label()
+        self._sync_layout_ui()
+        self._refresh_engine_label()
         self.setAcceptDrops(True)
 
     # ------------------------------------------------------------ UI 构建
@@ -234,6 +602,8 @@ class BatchPrinterApp(QMainWindow):
         # 顺序控制
         for t, fn, tip in (("↑ 上移", lambda: self.move_selected(-1), "把选中行上移一位"),
                            ("↓ 下移", lambda: self.move_selected(1), "把选中行下移一位"),
+                           ("👁 预览选中", self.preview_selected,
+                            "打印预览选中文件 (含页边距/缩放效果, 不耗纸)"),
                            ("⚙ 批量设置选中", lambda: self.batch_settings(),
                             "对选中的多个文件统一设置份数/色彩/双面/页码范围 (Ctrl/Shift 多选)")):
             b = QPushButton(t)
@@ -300,9 +670,15 @@ class BatchPrinterApp(QMainWindow):
         lv0.addWidget(self.drag_hint)
         splitter.addWidget(left)
 
-        right = QGroupBox(" 全局设置 (作用于整个列表) ")
-        right.setMinimumWidth(250)
-        g = QGridLayout(right)
+        right = QWidget()
+        right.setMinimumWidth(310)
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(6)
+
+        # ---- 打印参数
+        g1 = QGroupBox(" 打印参数 (作用于整个列表) ")
+        g = QGridLayout(g1)
         g.setVerticalSpacing(8)
 
         g.addWidget(QLabel("份数:"), 0, 0)
@@ -327,16 +703,42 @@ class BatchPrinterApp(QMainWindow):
         self.g_pages = QLineEdit(self.cfg["global"].get("pages", ""))
         self.g_pages.setPlaceholderText("如 1-3,5 留空=全部")
         g.addWidget(self.g_pages, 3, 1)
+        rv.addWidget(g1)
 
+        # ---- 版面设置 (只影响打印, 不改原文件)
+        g2 = QGroupBox(" 版面设置 (Word / Excel) ")
+        lv2 = QVBoxLayout(g2)
+        lv2.setSpacing(5)
+        self.layout_lbl = QLabel("")
+        self.layout_lbl.setWordWrap(True)
+        self.layout_lbl.setStyleSheet("color:#555;font-size:11px;")
+        lv2.addWidget(self.layout_lbl)
+        self.fit_width_chk = QCheckBox("Excel: 所有列缩到一页宽")
+        self.fit_width_chk.setToolTip("打开后, 每张工作表都按纸宽缩放到 1 页 (常用)")
+        self.fit_width_chk.toggled.connect(self._on_fit_width_toggled)
+        lv2.addWidget(self.fit_width_chk)
+        layout_btn = QPushButton("📐 更多版面设置 (页边距/方向/比例)…")
+        layout_btn.clicked.connect(self.edit_layout)
+        lv2.addWidget(layout_btn)
+        self.engine_lbl = QLabel("")
+        self.engine_lbl.setStyleSheet("color:#888;font-size:11px;")
+        self.engine_lbl.setWordWrap(True)
+        lv2.addWidget(self.engine_lbl)
+        rv.addWidget(g2)
+
+        # ---- 其他
+        g3 = QGroupBox(" 其他 ")
+        g3g = QGridLayout(g3)
+        g3g.setVerticalSpacing(6)
         self.subfolder_chk = QCheckBox("添加文件夹时包含子文件夹")
         self.subfolder_chk.setChecked(bool(self.cfg.get("subfolders", True)))
-        g.addWidget(self.subfolder_chk, 4, 0, 1, 2)
+        g3g.addWidget(self.subfolder_chk, 0, 0, 1, 2)
 
-        g.addWidget(QLabel("打印间隔(秒):"), 5, 0)
+        g3g.addWidget(QLabel("打印间隔(秒):"), 1, 0)
         self.interval_edit = QLineEdit(str(self.cfg.get("interval", 2.0)))
-        g.addWidget(self.interval_edit, 5, 1)
+        g3g.addWidget(self.interval_edit, 1, 1)
 
-        g.addWidget(QLabel("SumatraPDF:"), 6, 0)
+        g3g.addWidget(QLabel("SumatraPDF:"), 2, 0)
         sw = QHBoxLayout()
         self.sumatra_edit = QLineEdit(self.cfg.get("sumatra_path", ""))
         sw.addWidget(self.sumatra_edit)
@@ -344,21 +746,22 @@ class BatchPrinterApp(QMainWindow):
         browse.setFixedWidth(28)
         browse.clicked.connect(self._browse_sumatra)
         sw.addWidget(browse)
-        g.addLayout(sw, 6, 1)
+        g3g.addLayout(sw, 2, 1)
         hint = QLabel("PDF 静默打印推荐安装,\n留空自动搜索")
         hint.setStyleSheet("color:#888;font-size:11px;")
-        g.addWidget(hint, 7, 0, 1, 2)
+        g3g.addWidget(hint, 3, 0, 1, 2)
+        rv.addWidget(g3)
 
+        rv.addStretch(1)
         self.print_btn = QPushButton("🖨 立即打印全部")
         self.print_btn.setMinimumHeight(40)
         self.print_btn.setStyleSheet("font-weight:bold;font-size:14px;")
         self.print_btn.clicked.connect(self.start_print)
-        g.addWidget(self.print_btn, 8, 0, 1, 2)
+        rv.addWidget(self.print_btn)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_print)
-        g.addWidget(self.stop_btn, 9, 0, 1, 2)
-        g.setRowStretch(10, 1)
+        rv.addWidget(self.stop_btn)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 1)
 
@@ -397,6 +800,7 @@ class BatchPrinterApp(QMainWindow):
             "pages": self.g_pages.text().strip(),
         }
         self.cfg["subfolders"] = self.subfolder_chk.isChecked()
+        self.cfg["layout"] = dict(self.cfg.get("layout") or DEFAULT_LAYOUT_CFG)
         try:
             self.cfg["interval"] = max(0.0, float(self.interval_edit.text()))
         except ValueError:
@@ -433,6 +837,92 @@ class BatchPrinterApp(QMainWindow):
         if p:
             self.sumatra_edit.setText(p)
             self._refresh_sumatra_label()
+
+    # ------------------------------------------------------------ 版面设置
+
+    def layout_opts(self):
+        """配置里的版面设置 -> office_core 用的 layout dict"""
+        l = self.cfg.get("layout") or {}
+        lay = {
+            "margins_mm": None,
+            "orientation": l.get("orientation", ""),
+            "excel_fit": l.get("excel_fit", ""),
+            "excel_scale": l.get("excel_scale", 100),
+            "center": bool(l.get("center", False)),
+            "gridlines": bool(l.get("gridlines", False)),
+        }
+        if l.get("margins_on"):
+            lay["margins_mm"] = [l.get("top", 20), l.get("bottom", 20),
+                                 l.get("left", 20), l.get("right", 20)]
+        return lay
+
+    def _sync_layout_ui(self):
+        lay = self.cfg.setdefault("layout", dict(DEFAULT_LAYOUT_CFG))
+        summary = office_core.layout_summary(self.layout_opts())
+        self.layout_lbl.setText("当前: " + (summary or "保持原文件版面 (不改边距/缩放)"))
+        self.fit_width_chk.blockSignals(True)
+        self.fit_width_chk.setChecked(lay.get("excel_fit") == "width")
+        self.fit_width_chk.blockSignals(False)
+
+    def _on_fit_width_toggled(self, checked):
+        lay = self.cfg.setdefault("layout", dict(DEFAULT_LAYOUT_CFG))
+        if checked:
+            lay["excel_fit"] = "width"
+        elif lay.get("excel_fit") == "width":
+            lay["excel_fit"] = ""
+        self._sync_layout_ui()
+        self.save_config()
+
+    def _refresh_engine_label(self):
+        label, note = office_core.detect_engine()
+        if label:
+            self.engine_lbl.setText(f"Office 引擎: {label} ({note})")
+        else:
+            self.engine_lbl.setText("未检测到 Word/Excel, Office 文件将用系统关联程序打印")
+
+    def edit_layout(self):
+        d = LayoutDialog(self, self.layout_opts(), self.cfg.get("office_com", True))
+        if d.exec() == QDialog.Accepted:
+            self.cfg["layout"] = d.result_cfg()
+            self.cfg["office_com"] = d.office_chk.isChecked()
+            self._sync_layout_ui()
+            self.save_config()
+            self._log("版面设置: " + (office_core.layout_summary(self.layout_opts())
+                                      or "保持原文件版面"))
+
+    # ------------------------------------------------------------ 打印预览
+
+    def preview_selected(self, *_):
+        if self._printing():
+            QMessageBox.information(self, "提示", "打印进行中, 请等打印结束后再预览")
+            return
+        rows = self.selected_rows()
+        if not rows:
+            QMessageBox.information(self, "提示", "请先在列表中选中要预览的文件")
+            return
+        self._open_preview(rows[0])
+
+    def _open_preview(self, row):
+        if self._printing():
+            QMessageBox.information(self, "提示", "打印进行中, 请等打印结束后再预览")
+            return
+        if not (0 <= row < len(self.items)):
+            return
+        item = self.items[row]
+        g = self.cfg["global"]
+        opts = {
+            "copies": item["copies"] if item["copies"] is not None else (g["copies"] or None),
+            "color": item["color"] or g["color"] or None,
+            "duplex": item["duplex"] or g["duplex"] or None,
+            "pages": item["pages"] or g["pages"] or None,
+            "layout": self.layout_opts(),
+            "office_com": bool(self.cfg.get("office_com", True)),
+        }
+        d = PreviewDialog(self, item["path"], opts, self._ext_map(),
+                          self.current_printer(),
+                          find_sumatra(self.cfg.get("sumatra_path", "")),
+                          self._log)
+        d.exec()
 
     def refresh_printers(self):
         ps = list_printers()
@@ -694,6 +1184,9 @@ class BatchPrinterApp(QMainWindow):
         rows = self.selected_rows()
         m = QMenu(self)
         n = len(rows)
+        act_preview = m.addAction("👁 预览此文件" if n <= 1 else f"👁 预览第一个选中的文件")
+        act_preview.triggered.connect(self.preview_selected)
+        act_preview.setEnabled(bool(rows) and n >= 1)
         act_set = m.addAction(f"⚙ 批量设置选中的 {n} 个文件" if n > 1 else "⚙ 设置此文件")
         act_set.triggered.connect(lambda: self.batch_settings(rows))
         m.addSeparator()
@@ -975,39 +1468,52 @@ class BatchPrinterApp(QMainWindow):
         interval = self._to_float(self.interval_edit.text(), 2.0)
         ext_map = self._ext_map()
         items_snapshot = list(self.items)
+        layout = self.layout_opts()
+        office_com = bool(self.cfg.get("office_com", True))
 
         self.cancel_event.clear()
         self.print_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self._log(f"=== 开始打印, 共 {len(items_snapshot)} 项, 打印机: {printer} ===")
+        lay_txt = office_core.layout_summary(layout)
+        if lay_txt:
+            self._log(f"版面设置: {lay_txt}")
+        if office_com:
+            self._log("Office 文件使用静默打印 (COM 转 PDF 后发送, 不会弹出程序窗口)")
 
         def work():
             sig = self.sig
             # 整批打印期间把系统默认打印机切到所选打印机, 结束后恢复。
             # 没有这一步, Office/未知格式的 Shell 打印永远只会打到默认打印机。
             guard_log = lambda m: sig.log.emit(m)  # noqa: E731
-            with default_printer_guard(printer, guard_log):
-                for idx, item in enumerate(items_snapshot):
-                    if self.cancel_event.is_set():
-                        sig.status.emit(idx, "已取消")
-                        continue
-                    sig.status.emit(idx, "打印中")
-                    opts = {
-                        "copies": item["copies"] if item["copies"] is not None else (g["copies"] or None),
-                        "color": item["color"] or g["color"] or None,
-                        "duplex": item["duplex"] or g["duplex"] or None,
-                        "pages": item["pages"] or g["pages"] or None,
-                    }
-                    try:
-                        print_file(item["path"], printer, opts, ext_map, sumatra,
-                                   lambda m: sig.log.emit("  " + m))
-                        sig.status.emit(idx, "已发送")
-                    except Exception as e:
-                        sig.log.emit(f"❌ {os.path.basename(item['path'])}: {e}")
-                        sig.status.emit(idx, "失败")
-                    if interval > 0:
-                        self.cancel_event.wait(interval)
-            sig.done.emit()
+            try:
+                with default_printer_guard(printer, guard_log):
+                    for idx, item in enumerate(items_snapshot):
+                        if self.cancel_event.is_set():
+                            sig.status.emit(idx, "已取消")
+                            continue
+                        sig.status.emit(idx, "打印中")
+                        opts = {
+                            "copies": item["copies"] if item["copies"] is not None else (g["copies"] or None),
+                            "color": item["color"] or g["color"] or None,
+                            "duplex": item["duplex"] or g["duplex"] or None,
+                            "pages": item["pages"] or g["pages"] or None,
+                            "layout": layout,
+                            "office_com": office_com,
+                        }
+                        try:
+                            print_file(item["path"], printer, opts, ext_map, sumatra,
+                                       lambda m: sig.log.emit("  " + m))
+                            sig.status.emit(idx, "已发送")
+                        except Exception as e:
+                            sig.log.emit(f"❌ {os.path.basename(item['path'])}: {e}")
+                            sig.status.emit(idx, "失败")
+                        if interval > 0:
+                            self.cancel_event.wait(interval)
+            finally:
+                # 关闭本线程里复用的 Word/Excel 进程 (COM 进程不关会残留在后台)
+                office_core.close_session()
+                sig.done.emit()
 
         self.print_thread = threading.Thread(target=work, daemon=True)
         self.print_thread.start()
@@ -1055,7 +1561,41 @@ class BatchPrinterApp(QMainWindow):
         e.accept()
 
 
+def _office_selftest():
+    """打包后自检: 带环境变量 BP_SELFTEST=<Office 文件> 启动时, 导出 PDF 并写结果.
+
+    结果写入 %TEMP%\\bp_selftest.txt (窗口程序没有控制台, 只能落文件)。
+    仅用于验证打包后的 COM 链路是否可用, 正常使用不会触发。
+    """
+    src = os.environ.get("BP_SELFTEST")
+    if not src:
+        return False
+    out = os.path.join(tempfile.gettempdir(), "bp_selftest.txt")
+    text = ""
+    try:
+        pdf, work = office_core.export_pdf(
+            src, {"margins_mm": [15, 15, 15, 15], "excel_fit": "width"})
+        import pypdfium2 as pdfium
+        d = pdfium.PdfDocument(pdf)
+        n = len(d)
+        d.close()
+        shutil.rmtree(work, ignore_errors=True)
+        text = f"OK pages={n} pdf={pdf}\n"
+    except Exception as e:
+        text = f"FAIL {type(e).__name__}: {e}\n"
+    finally:
+        office_core.close_session()
+    try:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+    return True
+
+
 def main():
+    if _office_selftest():
+        return
     app = QApplication(sys.argv)
     win = BatchPrinterApp()
     win.show()

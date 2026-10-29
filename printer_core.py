@@ -4,8 +4,9 @@ printer_core.py - 批量打印核心引擎
 支持引擎:
   1. GDI 直印 (文本/图片): 完全控制份数/色彩/双面/页码范围
   2. SumatraPDF (PDF):    命令行完整控制
-  3. Shell 打印动词 (Office 等关联程序): 通过临时修改打印机默认 DEVMODE 控制份数/色彩/双面
-  4. RAW 直写 (prn/ps/pcl): 字节流直送打印机
+  3. Office COM (Word/Excel/PPT): 改版面 -> 转 PDF -> 走 PDF 通道, 全程静默
+  4. Shell 打印动词 (其他未知格式): 临时切默认打印机 + printto
+  5. RAW 直写 (prn/ps/pcl): 字节流直送打印机
 """
 
 import os
@@ -20,6 +21,9 @@ import win32con
 import win32gui
 import win32ui
 from PIL import Image, ImageWin
+
+import office_core
+from office_core import OfficeUnavailable
 
 # ---------------------------------------------------------------- 常量
 
@@ -543,11 +547,36 @@ def settings_to_devmode_values(copies=None, color=None, duplex=None):
     return c, col, dup
 
 
+def print_office_com(path, printer_name, copies, color, duplex, page_set,
+                     opts, sumatra_exe, log, kind=None):
+    """Office 文档: COM 改版面 -> 导出 PDF -> 走 PDF 通道静默打印.
+
+    这一步彻底摆脱了 Shell 的 print 动词: 不会弹程序窗口、不用切系统默认打印机,
+    并且能真正控制页边距/缩放 (Word 页边距、Excel 所有列缩到一页宽)。
+    """
+    layout = opts.get("layout")
+    pdf, work = office_core.export_pdf(path, layout, log, kind=kind)
+    try:
+        if sumatra_exe:
+            print_pdf_sumatra(sumatra_exe, pdf, printer_name, copies, color,
+                              duplex, page_set, log)
+        else:
+            try:
+                import pypdfium2  # noqa: F401
+            except ImportError:
+                raise RuntimeError("PDF 引擎不可用: 请安装 pypdfium2 或 SumatraPDF")
+            # Office 文档文字多, 用 300dpi 渲染, 比默认 200dpi 更清晰
+            print_pdf_gdi(pdf, printer_name, copies, color, duplex, page_set,
+                          log, dpi=300)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def print_file(path, printer_name, opts, ext_map, sumatra_exe, log):
     """
     打印单个文件.
     opts: dict(copies=int|None, color='color'|'mono'|None, duplex='simplex'|'duplex_long'|'duplex_short'|None,
-               pages=str|None)
+               pages=str|None, layout=dict|None, office_com=bool)
     """
     ext = os.path.splitext(path)[1].lower().lstrip(".")
     ext = ext_map.get(ext, ext)
@@ -572,7 +601,19 @@ def print_file(path, printer_name, opts, ext_map, sumatra_exe, log):
         fn = print_text_gdi if cat == CAT_TEXT else print_image_gdi
         fn(path, printer_name, copies, color, duplex, page_set, log)
     else:
-        _shell_print_with_defaults(path, printer_name, copies, color, duplex, log)
+        done = False
+        if opts.get("office_com", True):
+            try:
+                print_office_com(path, printer_name, copies, color, duplex,
+                                 page_set, opts, sumatra_exe, log,
+                                 kind=office_core.ext_kind("." + ext))
+                done = True
+            except OfficeUnavailable as e:
+                log(f"提示: {e} — 改用系统关联程序打印")
+            except Exception as e:
+                log(f"⚠ Office 静默打印失败: {e} — 退回系统关联程序打印")
+        if not done:
+            _shell_print_with_defaults(path, printer_name, copies, color, duplex, log)
 
 
 def _shell_print_with_defaults(path, printer_name, copies, color, duplex, log):
