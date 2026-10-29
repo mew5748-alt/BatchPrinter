@@ -19,7 +19,7 @@ import tempfile
 import shutil
 from functools import cmp_to_key
 
-from PySide6.QtCore import Qt, QObject, Signal, QSize
+from PySide6.QtCore import Qt, QObject, Signal, QSize, QTimer
 from PySide6.QtGui import QColor, QAction, QPixmap, QImage, QPainter, QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 import office_core
+from preview_ui import PreviewWindow, prune_cache
 from printer_core import (
     list_printers, get_default_printer, find_sumatra, print_file,
     resolve_category, all_known_exts, parse_page_range,
@@ -38,7 +39,7 @@ from printer_core import (
 from archive_util import extract_archive, cleanup_dir, is_archive
 
 APP_NAME = "BatchPrinter"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
@@ -92,6 +93,9 @@ DEFAULT_CONFIG = {
     "interval": 2.0,
     "sumatra_path": "",
     "ext_map": {},
+    "preview_auto": True,       # 单击文件自动弹出预览
+    "preview_pin": False,       # 预览小窗置顶
+    "preview_geo": None,        # 预览小窗位置/大小 [x, y, w, h]
 }
 
 COLOR_LABELS = {"": "跟随打印机", "color": "彩色", "mono": "黑白"}
@@ -328,225 +332,6 @@ class LayoutDialog(QDialog):
         }
 
 
-class PreviewDialog(QDialog):
-    """打印预览: Office/PDF 与真正打印使用同一份 PDF, 图片直接显示"""
-
-    def __init__(self, parent, path, opts, ext_map, printer, sumatra, log=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"打印预览 - {os.path.basename(path)}")
-        self.setModal(True)
-        self.resize(940, 780)
-        self.path = path
-        self.opts = opts or {}
-        self.ext_map = ext_map or {}
-        self.printer = printer
-        self.sumatra = sumatra
-        self.log = log or (lambda m: None)
-        self._pdf = None
-        self._work = None
-        self._images = []
-        self._zoom = 1.0
-        self.page_count = 0
-        self._cur = 0
-        self._build()
-        self._load()
-
-    # -------------------------------------------------- 界面
-    def _build(self):
-        v = QVBoxLayout(self)
-        v.setContentsMargins(8, 8, 8, 8)
-        v.setSpacing(6)
-
-        top = QHBoxLayout()
-        top.addWidget(QLabel("页码:"))
-        self.page_lbl = QLabel("—")
-        self.page_lbl.setStyleSheet("font-weight:bold;")
-        top.addWidget(self.page_lbl)
-        top.addStretch()
-        z_out = QPushButton("－ 缩小")
-        z_in = QPushButton("＋ 放大")
-        fit_b = QPushButton("适合宽度")
-        for b in (z_out, z_in, fit_b):
-            b.setFixedHeight(26)
-            top.addWidget(b)
-        z_out.clicked.connect(lambda: self._zoom_by(-0.25))
-        z_in.clicked.connect(lambda: self._zoom_by(0.25))
-        fit_b.clicked.connect(self._zoom_fit)
-        v.addLayout(top)
-
-        body = QHBoxLayout()
-        self.page_list = QListWidget()
-        self.page_list.setFixedWidth(72)
-        self.page_list.currentRowChanged.connect(self._on_page_changed)
-        body.addWidget(self.page_list)
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(False)
-        self.scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
-        self.canvas = QLabel("正在生成预览…")
-        self.canvas.setAlignment(Qt.AlignCenter)
-        self.canvas.setStyleSheet("background:#5a5a5a;color:#eee;padding:20px;")
-        self.canvas.setMinimumSize(320, 240)
-        self.scroll.setWidget(self.canvas)
-        body.addWidget(self.scroll, 1)
-        v.addLayout(body, 1)
-
-        bottom = QHBoxLayout()
-        self.info = QLabel("")
-        self.info.setStyleSheet("color:#555;font-size:11px;")
-        self.info.setWordWrap(True)
-        bottom.addWidget(self.info, 1)
-        self.print_btn = QPushButton("🖨 打印此文件")
-        self.print_btn.clicked.connect(self._print)
-        close_b = QPushButton("关闭")
-        close_b.clicked.connect(self.accept)
-        bottom.addWidget(self.print_btn)
-        bottom.addWidget(close_b)
-        v.addLayout(bottom)
-
-    # -------------------------------------------------- 生成预览数据
-    def _load(self):
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            ext = os.path.splitext(self.path)[1].lower().lstrip(".")
-            ext = self.ext_map.get(ext, ext)
-            cat = resolve_category(ext, self.ext_map)
-            note = ""
-            if cat == "office":
-                pdf, work = office_core.export_pdf(
-                    self.path, self.opts.get("layout"), self.log,
-                    kind=office_core.ext_kind("." + ext))
-                self._work = work
-                self._open_pdf(pdf)
-                note = "Office 转 PDF 预览"
-            elif cat == "pdf":
-                self._open_pdf(self.path)
-                note = "PDF 预览"
-            elif cat == "image":
-                img = QImage(self.path)
-                if img.isNull():
-                    from PIL import Image as PILImage
-                    im = PILImage.open(self.path).convert("RGB")
-                    img = QImage(im.tobytes("raw", "RGB"), im.width, im.height,
-                                 3 * im.width, QImage.Format_RGB888).copy()
-                self._images = [img]
-                self.page_count = 1
-                note = "图片预览"
-            else:
-                raise RuntimeError("该格式暂不支持预览 (文本/RAW 由打印机直接排版)")
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            msg = f"预览生成失败:\n{e}"
-            self.canvas.setText(msg)
-            self.canvas.resize(420, 160)
-            self.info.setText(str(e))
-            self.print_btn.setEnabled(False)
-            return
-        QApplication.restoreOverrideCursor()
-
-        self.page_list.blockSignals(True)
-        self.page_list.clear()
-        for i in range(self.page_count):
-            self.page_list.addItem(str(i + 1))
-        self.page_list.blockSignals(False)
-        self.page_list.setCurrentRow(0)
-        self._show_page(0)
-
-        copies = self.opts.get("copies")
-        lay_txt = office_core.layout_summary(self.opts.get("layout")) or "保持原文件版面"
-        self.info.setText(f"{note} · 共 {self.page_count} 页 · 打印机: {self.printer or '—'}"
-                          f" · 份数: {copies or '打印机默认'} · 版面: {lay_txt}")
-
-    def _open_pdf(self, pdf_path):
-        import pypdfium2 as pdfium
-        self._pdf = pdfium.PdfDocument(pdf_path)
-        self.page_count = len(self._pdf)
-
-    # -------------------------------------------------- 显示
-    def _on_page_changed(self, row):
-        if row >= 0:
-            self._show_page(row)
-
-    def _show_page(self, idx):
-        if not (0 <= idx < self.page_count):
-            return
-        self._cur = idx
-        self.page_lbl.setText(f"{idx + 1} / {self.page_count}")
-        avail = max(320, self.scroll.viewport().width() - 28)
-        try:
-            if self._pdf is not None:
-                page = self._pdf[idx]
-                w, h = page.get_size()
-                scale = (avail / float(w)) * self._zoom
-                pil = page.render(scale=max(0.1, scale)).to_pil()
-                img = QImage(pil.tobytes("raw", "RGB"), pil.width, pil.height,
-                             3 * pil.width, QImage.Format_RGB888).copy()
-                page.close()
-            else:
-                img = self._images[idx]
-                target = int(avail * self._zoom)
-                if img.width() != target:
-                    img = img.scaledToWidth(target, Qt.SmoothTransformation)
-            self.canvas.setPixmap(QPixmap.fromImage(img))
-            self.canvas.resize(img.width() + 16, img.height() + 16)
-        except Exception as e:
-            self.canvas.setText(f"渲染第 {idx + 1} 页失败: {e}")
-
-    def _zoom_by(self, delta):
-        self._zoom = min(3.0, max(0.3, self._zoom + delta))
-        self._show_page(self._cur)
-
-    def _zoom_fit(self):
-        self._zoom = 1.0
-        self._show_page(self._cur)
-
-    # -------------------------------------------------- 打印
-    def _print(self):
-        if not self.printer:
-            QMessageBox.warning(self, "提示", "请先在主界面选择打印机")
-            return
-        self.print_btn.setEnabled(False)
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            with default_printer_guard(self.printer, self.log):
-                print_file(self.path, self.printer, self.opts, self.ext_map,
-                           self.sumatra, self.log)
-            self.log(f"已从预览发送打印: {os.path.basename(self.path)}")
-            QMessageBox.information(self, "已发送", "已把该文件发送到打印机。")
-        except Exception as e:
-            QMessageBox.warning(self, "打印失败", str(e))
-        finally:
-            office_core.close_session()
-            QApplication.restoreOverrideCursor()
-            self.print_btn.setEnabled(True)
-
-    def closeEvent(self, e):
-        self._cleanup()
-        e.accept()
-
-    def accept(self):
-        self._cleanup()
-        super().accept()
-
-    def reject(self):
-        self._cleanup()
-        super().reject()
-
-    def _cleanup(self):
-        try:
-            if self._pdf is not None:
-                self._pdf.close()
-                self._pdf = None
-        except Exception:
-            pass
-        if self._work:
-            shutil.rmtree(self._work, ignore_errors=True)
-            self._work = None
-        try:
-            office_core.close_session()      # 预览用完的 Word/Excel 进程一并关掉
-        except Exception:
-            pass
-
-
 class BatchPrinterApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -561,6 +346,8 @@ class BatchPrinterApp(QMainWindow):
         self._last_sort_label = "添加顺序"
         self.print_thread = None
         self.cancel_event = threading.Event()
+        self._preview_row = -1
+        self._shutting_down = False
         self.sig = WorkerSignals()
         self.sig.log.connect(self._log)
         self.sig.status.connect(self._set_status)
@@ -572,6 +359,15 @@ class BatchPrinterApp(QMainWindow):
         self._sync_layout_ui()
         self._refresh_engine_label()
         self.setAcceptDrops(True)
+
+        self._build_preview_window()
+
+        # 单击列表某行 -> 延迟 120ms 再生成预览 (连续点选时只预览最后一个)
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(120)
+        self._preview_timer.timeout.connect(self._preview_current)
+        self.table.currentCellChanged.connect(self._on_current_changed)
 
     # ------------------------------------------------------------ UI 构建
 
@@ -602,14 +398,19 @@ class BatchPrinterApp(QMainWindow):
         # 顺序控制
         for t, fn, tip in (("↑ 上移", lambda: self.move_selected(-1), "把选中行上移一位"),
                            ("↓ 下移", lambda: self.move_selected(1), "把选中行下移一位"),
-                           ("👁 预览选中", self.preview_selected,
-                            "打印预览选中文件 (含页边距/缩放效果, 不耗纸)"),
                            ("⚙ 批量设置选中", lambda: self.batch_settings(),
                             "对选中的多个文件统一设置份数/色彩/双面/页码范围 (Ctrl/Shift 多选)")):
             b = QPushButton(t)
             b.setToolTip(tip)
             b.clicked.connect(fn)
             bar.addWidget(b)
+        # 预览小窗开关 (单击文件会自动预览)
+        self.preview_btn = QPushButton("👁 打印预览")
+        self.preview_btn.setCheckable(True)
+        self.preview_btn.setToolTip("显示/隐藏打印预览小窗 (单击列表中的文件即自动预览)\n"
+                                    "预览内容与真正打印完全一致, 不耗纸")
+        self.preview_btn.toggled.connect(self.toggle_preview_window)
+        bar.addWidget(self.preview_btn)
         bar.addSpacing(14)
         bar.addWidget(QLabel("排序:"))
         self.sort_combo = QComboBox()
@@ -664,8 +465,8 @@ class BatchPrinterApp(QMainWindow):
         lv0.setContentsMargins(0, 0, 0, 0)
         lv0.setSpacing(4)
         lv0.addWidget(self.table, 1)
-        self.drag_hint = QLabel("💡 列表顺序 = 打印顺序: 拖动行可调整先后; "
-                                "双击设置单个文件, 多选后双击/点「批量设置选中」统一设置")
+        self.drag_hint = QLabel("💡 单击文件即在预览小窗显示效果; 列表顺序 = 打印顺序, 拖动行可调整先后; "
+                                "双击设置单个文件, 多选后可点「批量设置选中」统一设置")
         self.drag_hint.setStyleSheet("color:#666;font-size:11px;")
         lv0.addWidget(self.drag_hint)
         splitter.addWidget(left)
@@ -770,7 +571,7 @@ class BatchPrinterApp(QMainWindow):
         lv = QVBoxLayout(logg)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(150)
+        self.log_text.setMaximumHeight(110)
         self.log_text.setStyleSheet("font-family:Consolas,monospace;font-size:12px;")
         lv.addWidget(self.log_text)
         root.addWidget(logg)
@@ -806,6 +607,12 @@ class BatchPrinterApp(QMainWindow):
         except ValueError:
             self.cfg["interval"] = 2.0
         self.cfg["sumatra_path"] = self.sumatra_edit.text().strip()
+        pw = getattr(self, "preview_win", None)
+        if pw is not None:
+            g = pw.geometry()
+            self.cfg["preview_geo"] = [g.x(), g.y(), g.width(), g.height()]
+            self.cfg["preview_pin"] = pw.pin_btn.isChecked()
+            self.cfg["preview_auto"] = pw.follow_chk.isChecked()
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(self.cfg, f, ensure_ascii=False, indent=2)
@@ -872,6 +679,8 @@ class BatchPrinterApp(QMainWindow):
             lay["excel_fit"] = ""
         self._sync_layout_ui()
         self.save_config()
+        if hasattr(self, "preview_win"):
+            self.preview_win.refresh()          # 版面变了, 预览立即跟着变
 
     def _refresh_engine_label(self):
         label, note = office_core.detect_engine()
@@ -889,28 +698,139 @@ class BatchPrinterApp(QMainWindow):
             self.save_config()
             self._log("版面设置: " + (office_core.layout_summary(self.layout_opts())
                                       or "保持原文件版面"))
+            if hasattr(self, "preview_win"):
+                self.preview_win.refresh()      # 面板改完立刻在预览小窗看效果
 
-    # ------------------------------------------------------------ 打印预览
+    # ------------------------------------------------------------ 打印预览小窗
 
-    def preview_selected(self, *_):
+    def _build_preview_window(self):
+        """预览是独立小窗: 不占主界面空间, 可拖动/置顶/关闭"""
+        try:
+            prune_cache()                   # 清掉上次遗留的预览缓存, 防止临时目录膨胀
+        except Exception:
+            pass
+        self.preview_win = PreviewWindow(self)
+        self.preview_win.print_handler = self._print_from_preview
+        self.preview_win.auto_changed.connect(self._on_preview_auto_changed)
+        self.preview_win.closed.connect(self._on_preview_closed)
+
+        self.preview_win.follow_chk.blockSignals(True)
+        self.preview_win.follow_chk.setChecked(bool(self.cfg.get("preview_auto", True)))
+        self.preview_win.follow_chk.blockSignals(False)
+
+        self.preview_win.pin_btn.blockSignals(True)
+        self.preview_win.pin_btn.setChecked(bool(self.cfg.get("preview_pin", False)))
+        self.preview_win.pin_btn.blockSignals(False)
+        if self.cfg.get("preview_pin"):
+            self.preview_win.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+
+        geo = self.cfg.get("preview_geo")
+        if isinstance(geo, (list, tuple)) and len(geo) == 4:
+            try:
+                self.preview_win.setGeometry(int(geo[0]), int(geo[1]),
+                                             max(300, int(geo[2])), max(340, int(geo[3])))
+                self._preview_geo_set = True
+            except (TypeError, ValueError):
+                self._preview_geo_set = False
+        else:
+            self._preview_geo_set = False
+
+    def toggle_preview_window(self, on):
+        pw = getattr(self, "preview_win", None)
+        if pw is None:
+            return
+        if on:
+            # 手动打开 = 恢复"单击即预览"
+            pw.follow_chk.blockSignals(True)
+            pw.follow_chk.setChecked(True)
+            pw.follow_chk.blockSignals(False)
+            self.cfg["preview_auto"] = True
+            self._place_preview_window(force=False)
+            pw.show()
+            pw.raise_()
+            row = self._preview_row
+            if not (0 <= row < len(self.items)):
+                rows = self.selected_rows()
+                row = rows[0] if rows else -1
+            if 0 <= row < len(self.items):
+                self._preview_row_at(row, force=True)
+            else:
+                pw.clear()
+        else:
+            pw.close()
+
+    def _place_preview_window(self, force=False):
+        """第一次显示时放到主窗口右侧; 用户拖动过就沿用记住的位置"""
+        pw = self.preview_win
+        if self._preview_geo_set and not force:
+            return
+        scr = self.screen().availableGeometry() if self.screen() else None
+        w, h = pw.width(), pw.height()
+        x = self.x() + self.width() + 8
+        y = self.y() + 40
+        if scr is not None:
+            if x + w > scr.right():
+                x = max(scr.left() + 8, self.x() - w - 8)
+            y = min(max(scr.top() + 8, y), scr.bottom() - h - 8)
+        else:
+            x = self.x() + self.width() - w - 30
+        pw.move(x, y)
+
+    def _on_preview_auto_changed(self, on):
+        self.cfg["preview_auto"] = bool(on)
+        self.save_config()
+        self._log("预览跟随选择: " + ("开" if on else "关"))
+
+    def _on_preview_closed(self):
+        """用户关掉小窗: 按钮取消勾选, 并暂停"单击即预览"(再点按钮可恢复)"""
+        self.preview_btn.blockSignals(True)
+        self.preview_btn.setChecked(False)
+        self.preview_btn.blockSignals(False)
+        if self._shutting_down:                 # 程序退出时不改用户的偏好
+            return
+        self.preview_win.follow_chk.blockSignals(True)
+        self.preview_win.follow_chk.setChecked(False)
+        self.preview_win.follow_chk.blockSignals(False)
+        self.cfg["preview_auto"] = False
+        self.save_config()
+
+    def _on_current_changed(self, row, *_):
+        """单击/键盘切换当前行 -> 延迟一点点再预览 (连点只预览最后一个)"""
+        if row is None or row < 0:
+            return
+        self._preview_row = int(row)
+        if not self.cfg.get("preview_auto", True):
+            return
         if self._printing():
-            QMessageBox.information(self, "提示", "打印进行中, 请等打印结束后再预览")
             return
-        rows = self.selected_rows()
-        if not rows:
-            QMessageBox.information(self, "提示", "请先在列表中选中要预览的文件")
-            return
-        self._open_preview(rows[0])
+        self._preview_timer.start()
 
-    def _open_preview(self, row):
-        if self._printing():
-            QMessageBox.information(self, "提示", "打印进行中, 请等打印结束后再预览")
-            return
+    def _preview_current(self):
+        row = self._preview_row
+        if 0 <= row < len(self.items):
+            self._preview_row_at(row, force=False)
+
+    def _preview_row_at(self, row, force=False):
         if not (0 <= row < len(self.items)):
             return
+        if self._printing():
+            return
+        if not force and not self.cfg.get("preview_auto", True):
+            return
         item = self.items[row]
+        pw = self.preview_win
+        if not pw.isVisible():
+            self._place_preview_window(force=False)
+            pw.show()
+        self.preview_btn.blockSignals(True)
+        self.preview_btn.setChecked(True)
+        self.preview_btn.blockSignals(False)
+        pw.set_file(item["path"], self._opts_for_item(item), self._ext_map(),
+                    self.current_printer())
+
+    def _opts_for_item(self, item):
         g = self.cfg["global"]
-        opts = {
+        return {
             "copies": item["copies"] if item["copies"] is not None else (g["copies"] or None),
             "color": item["color"] or g["color"] or None,
             "duplex": item["duplex"] or g["duplex"] or None,
@@ -918,11 +838,43 @@ class BatchPrinterApp(QMainWindow):
             "layout": self.layout_opts(),
             "office_com": bool(self.cfg.get("office_com", True)),
         }
-        d = PreviewDialog(self, item["path"], opts, self._ext_map(),
-                          self.current_printer(),
-                          find_sumatra(self.cfg.get("sumatra_path", "")),
-                          self._log)
-        d.exec()
+
+    def _print_from_preview(self, path, opts):
+        """预览小窗里点「打印此文件」"""
+        if self._printing():
+            QMessageBox.information(self, "提示", "已有打印任务正在进行, 请稍后再试")
+            return False
+        printer = self.current_printer()
+        if not printer:
+            QMessageBox.warning(self, "提示", "请先在主界面选择打印机")
+            return False
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with default_printer_guard(printer, self._log):
+                print_file(path, printer, opts, self._ext_map(),
+                           find_sumatra(self.cfg.get("sumatra_path", "")), self._log)
+        except Exception as e:
+            QMessageBox.warning(self, "打印失败", str(e))
+            return False
+        finally:
+            office_core.close_session()     # 关掉主线程里临时启动的 Word/Excel
+            QApplication.restoreOverrideCursor()
+        self._log(f"已从预览发送: {os.path.basename(path)}")
+        return True
+
+    def preview_selected(self, *_):
+        """菜单/右键: 打开预览小窗并预览当前选中的文件"""
+        rows = self.selected_rows()
+        if not rows:
+            QMessageBox.information(self, "提示", "请先在列表中选中要预览的文件")
+            return
+        if self._printing():
+            QMessageBox.information(self, "提示", "打印进行中, 请等打印结束后再预览")
+            return
+        self._preview_row_at(rows[0], force=True)
+
+    def _open_preview(self, row):
+        self._preview_row_at(row, force=True)
 
     def refresh_printers(self):
         ps = list_printers()
@@ -1171,6 +1123,9 @@ class BatchPrinterApp(QMainWindow):
         self.items.clear()
         self._seq = 0
         self._added_seq = 0
+        self._preview_row = -1
+        if hasattr(self, "preview_win"):
+            self.preview_win.clear()
 
     # ------------------------------------------------------------ 个体/批量设置
 
@@ -1184,7 +1139,7 @@ class BatchPrinterApp(QMainWindow):
         rows = self.selected_rows()
         m = QMenu(self)
         n = len(rows)
-        act_preview = m.addAction("👁 预览此文件" if n <= 1 else f"👁 预览第一个选中的文件")
+        act_preview = m.addAction("👁 在预览小窗中查看" if n <= 1 else "👁 在预览小窗中查看第一个")
         act_preview.triggered.connect(self.preview_selected)
         act_preview.setEnabled(bool(rows) and n >= 1)
         act_set = m.addAction(f"⚙ 批量设置选中的 {n} 个文件" if n > 1 else "⚙ 设置此文件")
@@ -1556,6 +1511,11 @@ class BatchPrinterApp(QMainWindow):
                 return
             self.cancel_event.set()
         self.save_config()
+        self._shutting_down = True
+        pw = getattr(self, "preview_win", None)
+        if pw is not None:
+            pw.shutdown()                    # 停掉后台预览线程, 关掉临时 Word/Excel
+            pw.close()
         for t in self.temp_roots:
             cleanup_dir(t)
         e.accept()
