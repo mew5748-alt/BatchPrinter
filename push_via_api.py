@@ -40,10 +40,12 @@ def req(method, url, data=None, raw=False, retries=4):
 
 def main():
     root = os.path.dirname(os.path.abspath(__file__))
-    files = ["main.py", "printer_core.py", "archive_util.py", "setup_main.py",
-             "gen_installer.py", "test_core.py", "test_printer_target.py",
-             "README.md", "LICENSE",
-             ".gitignore", "SHA256SUMS.txt", "app.ico", "push_via_api.py"]
+    # 直接读 git 已跟踪文件, 避免手写清单漏文件 (v1.2~v1.4 新增的 office_core/preview_ui 等)
+    import subprocess
+    out = subprocess.run(["git", "ls-files"], cwd=root, capture_output=True,
+                         text=True, check=True).stdout
+    files = [l.strip() for l in out.splitlines() if l.strip()]
+    msg = sys.argv[1] if len(sys.argv) > 1 else "sync"
 
     # 仓库是否为空 (无 main 分支)
     try:
@@ -79,9 +81,7 @@ def main():
     print("tree:", t["sha"][:10])
 
     # 3. commit
-    commit_data = {"message": "v1.0.2: fix selected printer being ignored; drag reorder, "
-                              "name/mtime sorting, multi-select batch settings, natural sort",
-                   "tree": t["sha"]}
+    commit_data = {"message": msg, "tree": t["sha"]}
     if base_sha:
         commit_data["parents"] = [base_sha]
     c = req("POST", f"{API}/git/commits", commit_data)
