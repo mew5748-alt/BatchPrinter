@@ -194,6 +194,68 @@ def restore_printer_defaults(h, original):
             pass
 
 
+# ---------------------------------------------------------------- 默认打印机临时切换
+
+def get_default_printer_name():
+    """当前系统默认打印机名 (失败返回空串)"""
+    try:
+        return win32print.GetDefaultPrinter()
+    except Exception:
+        return ""
+
+
+def printer_driver_port(printer_name):
+    """返回 (驱动名, 端口名), 供 printto 动词拼参数"""
+    try:
+        h = win32print.OpenPrinter(printer_name)
+        try:
+            info = win32print.GetPrinter(h, 2)
+            return info.get("pDriverName", "") or "", info.get("pPortName", "") or ""
+        finally:
+            win32print.ClosePrinter(h)
+    except Exception:
+        return "", ""
+
+
+class default_printer_guard:
+    """打印期间把系统默认打印机临时切到目标打印机, 退出时恢复.
+
+    必要性: ShellExecute 的 'print' 动词没有指定打印机的参数, 关联程序一律打到
+    系统默认打印机。不切换的话, 界面上选的打印机对 Office/未知格式完全无效。
+    """
+
+    def __init__(self, printer_name, log=None):
+        self.target = (printer_name or "").strip()
+        self.log = log
+        self.original = ""
+        self.changed = False
+
+    def __enter__(self):
+        self.original = get_default_printer_name()
+        if not self.target or self.target == self.original:
+            return self
+        try:
+            win32print.SetDefaultPrinter(self.target)
+            self.changed = True
+            if self.log:
+                self.log(f"临时把系统默认打印机切到「{self.target}」"
+                         f"(打印结束后自动恢复为「{self.original}」)")
+        except Exception as e:
+            if self.log:
+                self.log(f"⚠ 无法临时切换默认打印机 ({e}), 将尝试用 printto 动词指定打印机")
+        return self
+
+    def __exit__(self, *_exc):
+        if self.changed and self.original:
+            try:
+                win32print.SetDefaultPrinter(self.original)
+                if self.log:
+                    self.log(f"已恢复系统默认打印机为「{self.original}」")
+            except Exception:
+                pass
+        return False
+
+
 # ---------------------------------------------------------------- GDI 直印 (文本/图片)
 
 def _open_printer_dc(printer_name, copies=None, color=None, duplex=None):
@@ -381,21 +443,49 @@ _SHELL_ERRORS = {
 }
 
 
+def _shell_printto(path, printer_name, dirname, log):
+    """用 printto 动词显式指定打印机 (参数: 打印机名 驱动名 端口名)"""
+    driver, port = printer_driver_port(printer_name)
+    params = f'"{printer_name}"'
+    if driver:
+        params += f' "{driver}"'
+        if port:
+            params += f' "{port}"'
+    ret = win32api.ShellExecute(0, "printto", path, params, dirname, win32con.SW_HIDE)
+    if ret > 32:
+        if log:
+            log(f"Shell 打印已发送 (printto → {printer_name}): {os.path.basename(path)}")
+        return True
+    return False
+
+
 def shell_print(path, printer_name="", log=None):
-    """调用 Windows Shell 'print' 动词 (由文件关联程序处理), 失败时尝试 'printto' 备用动词"""
+    """调用 Windows Shell 打印动词 (由文件关联程序处理)
+
+    注意: 'print' 动词不能指定打印机, 只会打到系统默认打印机——所以调用方应先用
+    default_printer_guard 把默认打印机切到目标。若默认打印机仍不是目标打印机
+    (切换失败), 优先用 'printto' 动词显式指定, 避免打到错误的打印机。
+    """
     dirname = os.path.dirname(path)
+    base = os.path.basename(path)
+
+    default_is_target = (not printer_name) or (get_default_printer_name() == printer_name)
+
+    # 默认打印机不是目标时: 先用 printto (能显式指定打印机)
+    if not default_is_target and _shell_printto(path, printer_name, dirname, log):
+        return
+
     ret = win32api.ShellExecute(0, "print", path, None, dirname, win32con.SW_HIDE)
     if ret > 32:
         if log:
-            log(f"Shell 打印已发送: {os.path.basename(path)}")
+            log(f"Shell 打印已发送: {base}"
+                + ("" if default_is_target else f" (目标打印机 {printer_name})"))
         return
-    # print/printto 失败常见于默认关联程序是 UWP 应用 (如 Edge), 尝试 printto 备用动词
-    if printer_name:
-        ret2 = win32api.ShellExecute(0, "printto", path, f'"{printer_name}"', dirname, win32con.SW_HIDE)
-        if ret2 > 32:
-            if log:
-                log(f"Shell 打印已发送 (printto): {os.path.basename(path)}")
-            return
+
+    # 'print' 不可用 (常见于默认打开程序是 UWP 应用) -> 再用 printto 试一次
+    if printer_name and default_is_target and _shell_printto(path, printer_name, dirname, log):
+        return
+
     raise RuntimeError(
         f"Shell 打印失败: {_SHELL_ERRORS.get(ret, f'错误码 {ret}')} ({os.path.splitext(path)[1]})。"
         f"常见原因: 该格式的默认打开程序是 UWP 应用 (如 Edge/照片) 或未注册经典打印动词。"
@@ -494,7 +584,12 @@ def _shell_print_with_defaults(path, printer_name, copies, color, duplex, log):
     except PrinterSettingsError as e:
         log(f"提示: 无法修改打印机默认设置 ({e}), 将按打印机当前默认值打印")
     try:
-        shell_print(path, printer_name, log)
+        # 单文件单独调用时也要保证打到所选打印机 (批量打印时外层已切换, 这里是无操作)
+        with default_printer_guard(printer_name, log) as guard:
+            shell_print(path, printer_name, log)
+            if guard.changed:
+                # 给关联程序读取"当前默认打印机"的时间, 再恢复
+                time.sleep(1.5)
         if note:
             log("  - " + note[0])
     finally:

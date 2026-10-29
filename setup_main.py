@@ -10,8 +10,13 @@ import sys
 import zipfile
 import ctypes
 
+VERSION = "1.0.2"
+SILENT = "--silent" in sys.argv or "/S" in sys.argv
+
 
 def msg(text, title="BatchPrinter 安装程序", style=0x40):  # 0x40=信息
+    if SILENT:
+        return
     ctypes.windll.user32.MessageBoxW(0, text, title, style)
 
 
@@ -84,7 +89,7 @@ pause
              f"$s.TargetPath='{exe}'; $s.WorkingDirectory='{dest}'; $s.Save()")
 
     sc = "已创建开始菜单和桌面快捷方式" if (ok1 and ok2) else "快捷方式创建失败, 可手动运行程序目录中的 BatchPrinter.exe"
-    msg(f"BatchPrinter 安装完成!\n\n安装位置: {dest}\n{sc}\n\n"
+    msg(f"BatchPrinter v{VERSION} 安装完成!\n\n安装位置: {dest}\n{sc}\n\n"
         f"卸载方法: 运行安装目录中的 uninstall.cmd", style=0x40)
 
 
