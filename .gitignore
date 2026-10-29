@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+installer_src/
+setup_payload/
+
+# 运行时产物
+config.json
+app_preview.png
+
+# 大文件产物 (通过 GitHub Release 发布, 不进 git)
+*.zip
+*.exe
+
+# 系统
+Thumbs.db
+.DS_Store
