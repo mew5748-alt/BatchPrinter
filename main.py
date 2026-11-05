@@ -44,7 +44,7 @@ APP_NAME = "BatchPrinter"
 PREVIEW_MIN_W = 240          # 预览列最窄
 PREVIEW_DEFAULT_W = 330      # 默认宽度
 PREVIEW_MAX_W = 620          # 最宽
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 
 APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
@@ -138,6 +138,10 @@ def file_mtime(path):
 STATUS_COLORS = {"已发送": "#1c7c2e", "失败": "#c0392b", "打印中": "#1a5fb4", "已取消": "#888"}
 
 
+# 每次启动都重置回默认的设置 (打印机和打印参数不跨会话保留)
+RESET_ON_START = ("printer", "global", "layout", "interval")
+
+
 def load_config():
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if os.path.isfile(CONFIG_PATH):
@@ -153,6 +157,11 @@ def load_config():
                     cfg[k] = v
         except Exception:
             pass
+    # 每次打开都回到默认状态: 打印机跟随系统默认, 份数/色彩/双面/页码/纸型/
+    # 纸张来源/逐页/版面(页边距/缩放)/文件间隔 全部恢复初始值。
+    # 仍会保留的: Sumatra 路径、扩展名映射、Office 静默开关、预览面板宽度和收起状态。
+    for k in RESET_ON_START:
+        cfg[k] = json.loads(json.dumps(DEFAULT_CONFIG[k]))
     return cfg
 
 

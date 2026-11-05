@@ -150,6 +150,42 @@ def main():
     pump(app, 120)
     check("队列为空提示", "队列为空" in w.eff_lbl.text(), w.eff_lbl.text())
 
+    print("\n[9] 每次启动重置为默认设置")
+    # 模拟上次会话留下的一堆非默认设置
+    with open(M.CONFIG_PATH, "w", encoding="utf-8") as f:
+        import json as _json
+        _json.dump({
+            "printer": "某台上次选的打印机",
+            "global": {"copies": 9, "color": "mono", "duplex": "duplex_long",
+                       "pages": "2-4", "paper": 8, "source": 3,
+                       "per_page": True, "page_gap": 5.0},
+            "layout": {"word_margins_mm": [5, 5, 5, 5], "excel_fit_width": True},
+            "interval": 9.0,
+            # 以下应当被保留
+            "sumatra_path": "C:/tools/SumatraPDF.exe",
+            "ext_map": {"dat": "txt"},
+            "office_com": False,
+            "preview_show": False,
+            "preview_width": 420,
+        }, f)
+    cfg = M.load_config()
+    check("打印机回到默认 (跟随系统)", cfg["printer"] == "", str(cfg.get("printer")))
+    check("份数回到 1", cfg["global"]["copies"] == 1, str(cfg["global"]["copies"]))
+    check("色彩回到空 (跟随打印机)", cfg["global"]["color"] == "", str(cfg["global"]["color"]))
+    check("双面回到空", cfg["global"]["duplex"] == "", str(cfg["global"]["duplex"]))
+    check("页码范围回到空", cfg["global"]["pages"] == "", str(cfg["global"]["pages"]))
+    check("纸型回到 0 (跟随打印机)", cfg["global"]["paper"] == 0, str(cfg["global"]["paper"]))
+    check("纸张来源回到 0", cfg["global"]["source"] == 0, str(cfg["global"]["source"]))
+    check("逐页关闭", cfg["global"]["per_page"] is False, str(cfg["global"]["per_page"]))
+    check("版面回到默认", cfg["layout"] == M.DEFAULT_LAYOUT_CFG, str(cfg["layout"]))
+    check("文件间隔回到 2.0", cfg["interval"] == 2.0, str(cfg["interval"]))
+    check("Sumatra 路径保留", cfg["sumatra_path"] == "C:/tools/SumatraPDF.exe",
+          str(cfg.get("sumatra_path")))
+    check("扩展名映射保留", cfg["ext_map"] == {"dat": "txt"}, str(cfg.get("ext_map")))
+    check("Office 静默开关保留", cfg["office_com"] is False, str(cfg.get("office_com")))
+    check("预览面板状态保留", cfg["preview_show"] is False and cfg["preview_width"] == 420,
+          str((cfg.get("preview_show"), cfg.get("preview_width"))))
+
     w.deleteLater()
     print(f"\n=== 通过 {PASS} 项, 失败 {FAIL} 项 ===")
     return 1 if FAIL else 0
