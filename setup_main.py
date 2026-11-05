@@ -10,7 +10,7 @@ import sys
 import zipfile
 import ctypes
 
-VERSION = "1.4.0"
+VERSION = "1.4.2"
 SILENT = "--silent" in sys.argv or "/S" in sys.argv
 
 

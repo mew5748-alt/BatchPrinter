@@ -44,7 +44,7 @@ APP_NAME = "BatchPrinter"
 PREVIEW_MIN_W = 240          # 预览列最窄
 PREVIEW_DEFAULT_W = 330      # 默认宽度
 PREVIEW_MAX_W = 620          # 最宽
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.2"
 
 APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
@@ -109,6 +109,13 @@ DUPLEX_LABELS = {"": "跟随打印机", "simplex": "单面",
 COLOR_LABEL2VAL = {v: k for k, v in COLOR_LABELS.items()}
 DUPLEX_LABEL2VAL = {v: k for k, v in DUPLEX_LABELS.items()}
 
+# 表格里用短标签 (「跟随打印机」5 个字太占地方)
+TABLE_COLOR_LABELS = {"": "驱动", "color": "彩色", "mono": "黑白"}
+TABLE_DUPLEX_LABELS = {"": "驱动", "simplex": "单面",
+                       "duplex_long": "双面长", "duplex_short": "双面短"}
+INHERIT_FG = "#8c8c8c"      # 跟随全局 -> 灰色
+OVERRIDE_FG = "#111111"     # 本文件单独设置 -> 黑色加粗
+
 STATUS_QUEUED = "等待中"
 C_SEQ, C_NAME, C_TYPE, C_COPIES, C_COLOR, C_DUPLEX, C_PAGES, C_STATUS = range(8)
 COLS = ["#", "文件名", "类型", "份数", "色彩", "双面", "页码范围", "状态"]
@@ -131,6 +138,10 @@ def file_mtime(path):
 STATUS_COLORS = {"已发送": "#1c7c2e", "失败": "#c0392b", "打印中": "#1a5fb4", "已取消": "#888"}
 
 
+# 每次启动都重置回默认的设置 (打印机和打印参数不跨会话保留)
+RESET_ON_START = ("printer", "global", "layout", "interval")
+
+
 def load_config():
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if os.path.isfile(CONFIG_PATH):
@@ -146,6 +157,11 @@ def load_config():
                     cfg[k] = v
         except Exception:
             pass
+    # 每次打开都回到默认状态: 打印机跟随系统默认, 份数/色彩/双面/页码/纸型/
+    # 纸张来源/逐页/版面(页边距/缩放)/文件间隔 全部恢复初始值。
+    # 仍会保留的: Sumatra 路径、扩展名映射、Office 静默开关、预览面板宽度和收起状态。
+    for k in RESET_ON_START:
+        cfg[k] = json.loads(json.dumps(DEFAULT_CONFIG[k]))
     return cfg
 
 
@@ -362,12 +378,19 @@ class BatchPrinterApp(QMainWindow):
         self.sig.status.connect(self._set_status)
         self.sig.done.connect(self._on_done)
 
+        # 全局参数一改就把新值刷到每一行 (节流, 几百行也不卡)
+        self._eff_timer = QTimer(self)
+        self._eff_timer.setSingleShot(True)
+        self._eff_timer.setInterval(80)
+        self._eff_timer.timeout.connect(self._refresh_effective_now)
+
         self._build_ui()
         self._init_paper_ui()
         self.refresh_printers()
         self._refresh_sumatra_label()
         self._sync_layout_ui()
         self._refresh_engine_label()
+        self._refresh_effective_now()
         self.setAcceptDrops(True)
 
         # 单击列表某行 -> 延迟 120ms 再生成预览 (连续点选时只预览最后一个)
@@ -476,9 +499,20 @@ class BatchPrinterApp(QMainWindow):
         lv0 = QVBoxLayout(table_area)
         lv0.setContentsMargins(0, 0, 0, 0)
         lv0.setSpacing(4)
+
+        # 生效参数摘要: 改右边的全局参数时这里实时变, 一眼看出"到底生效没有"
+        self.eff_lbl = QLabel("")
+        self.eff_lbl.setWordWrap(True)
+        self.eff_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.eff_lbl.setStyleSheet(
+            "QLabel{background:#eef4fb;border:1px solid #cddff1;border-radius:4px;"
+            "color:#1f4a75;font-size:11px;padding:3px 7px;}")
+        lv0.addWidget(self.eff_lbl)
+
         lv0.addWidget(self.table, 1)
-        self.drag_hint = QLabel("💡 单击文件即在右侧预览; 列表顺序 = 打印顺序 (可拖动行调整); "
-                                "双击设置单个文件")
+        self.drag_hint = QLabel(
+            "💡 单击文件即在右侧预览; 列表顺序 = 打印顺序 (可拖动行调整); 双击设置单个文件\n"
+            "表格里 灰色 = 跟随右侧全局参数, 黑色加粗 = 本文件单独设置")
         self.drag_hint.setWordWrap(True)
         self.drag_hint.setStyleSheet("color:#666;font-size:11px;")
         lv0.addWidget(self.drag_hint)
@@ -874,14 +908,24 @@ class BatchPrinterApp(QMainWindow):
                     self.current_printer())
 
     def _opts_for_item(self, item):
-        g = self.cfg["global"]
+        """单个文件最终会用到的打印参数
+
+        全局项直接取界面上的**实时值** (不再读 cfg —— 以前界面改了参数但还没保存,
+        从预览里单打一个文件仍按旧值打, 看起来就像"没生效")。
+        """
+        g = self.global_values()
         paper, _paper_txt = self.current_paper()
         source, _src_txt = self.current_source()
+
+        def pick(key):
+            v = item.get(key)
+            return g[key] if v is None else v      # None=跟随全局; ""=本文件单独设"跟随打印机"
+
         opts = {
-            "copies": item["copies"] if item["copies"] is not None else (g["copies"] or None),
-            "color": item["color"] or g["color"] or None,
-            "duplex": item["duplex"] or g["duplex"] or None,
-            "pages": item["pages"] or g["pages"] or None,
+            "copies": pick("copies") or None,
+            "color": pick("color") or None,
+            "duplex": pick("duplex") or None,
+            "pages": pick("pages") or None,
             "layout": self.layout_opts(),
             "office_com": bool(self.cfg.get("office_com", True)),
             "paper": paper,
@@ -955,6 +999,16 @@ class BatchPrinterApp(QMainWindow):
         self.g_gap.setValue(max(0.0, float(g.get("page_gap") or 0.0)))
         self.g_per_page.toggled.connect(self._sync_per_page)
         self.printer_combo.currentTextChanged.connect(self._on_printer_changed)
+        # 任何一个全局参数变了 -> 摘要条 + 各行显示立刻跟着变
+        for w, sig in ((self.g_copies, "valueChanged"),
+                       (self.g_color, "currentTextChanged"),
+                       (self.g_duplex, "currentTextChanged"),
+                       (self.g_pages, "textChanged"),
+                       (self.g_paper, "currentTextChanged"),
+                       (self.g_source, "currentTextChanged"),
+                       (self.g_per_page, "toggled"),
+                       (self.g_gap, "valueChanged")):
+            getattr(w, sig).connect(self._on_global_changed)
         self._sync_per_page()
 
     def _sync_per_page(self, *_):
@@ -1016,6 +1070,7 @@ class BatchPrinterApp(QMainWindow):
         self.g_source.setCurrentIndex(idx if idx >= 0 else 0)
         self.g_source.blockSignals(False)
         self.g_source.setEnabled(self.g_source.count() > 1)
+        self._on_global_changed()          # 换打印机后纸型/来源变了, 摘要条同步
 
     def _on_printer_changed(self, *_):
         if getattr(self, "_filling_printers", False):
@@ -1040,6 +1095,144 @@ class BatchPrinterApp(QMainWindow):
     def _ext_map(self):
         return {k.lower().lstrip("."): v.lower().lstrip(".")
                 for k, v in self.cfg.get("ext_map", {}).items()}
+
+    # ------------------------------------------------------------ 生效参数的显示
+
+    def global_values(self):
+        """右侧全局参数的当前取值 (没单独设置的文件就按这些值打印)"""
+        return {
+            "copies": int(self.g_copies.value()),
+            "color": COLOR_LABEL2VAL.get(self.g_color.currentText(), ""),
+            "duplex": DUPLEX_LABEL2VAL.get(self.g_duplex.currentText(), ""),
+            "pages": self.g_pages.text().strip(),
+        }
+
+    def _row_effective(self, item, gv):
+        """一行里 份数/色彩/双面/页码范围 的**实际取值**
+
+        item 里 None = 没单独设置 (跟随全局); 其它值 = 本文件单独设置。
+        返回 [(显示文本, 是否跟随全局, 单元格提示), ...]
+        """
+        out = []
+        if item["copies"] is None:
+            out.append((str(gv["copies"]), True, f"跟随全局: {gv['copies']} 份"))
+        else:
+            out.append((str(item["copies"]), False,
+                        f"本文件单独设置: {item['copies']} 份"))
+        if item["color"] is None:
+            out.append((TABLE_COLOR_LABELS.get(gv["color"], gv["color"]), True,
+                        "跟随全局: " + COLOR_LABELS.get(gv["color"], "跟随打印机")))
+        else:
+            out.append((TABLE_COLOR_LABELS.get(item["color"] or "", "驱动"), False,
+                        "本文件单独设置: " + COLOR_LABELS.get(item["color"], "跟随打印机")))
+        if item["duplex"] is None:
+            out.append((TABLE_DUPLEX_LABELS.get(gv["duplex"], gv["duplex"]), True,
+                        "跟随全局: " + DUPLEX_LABELS.get(gv["duplex"], "跟随打印机")))
+        else:
+            out.append((TABLE_DUPLEX_LABELS.get(item["duplex"] or "", "驱动"), False,
+                        "本文件单独设置: " + DUPLEX_LABELS.get(item["duplex"], "跟随打印机")))
+        if item["pages"] is None:
+            out.append((gv["pages"] or "全部", True,
+                        "跟随全局: " + (gv["pages"] or "全部页")))
+        else:
+            out.append((item["pages"], False, "本文件单独设置: " + item["pages"]))
+        return out
+
+    def _row_tip(self, item, gv):
+        """整行提示: 完整路径 + 这一行最终会用到的参数 (含纸型/进纸/逐页)"""
+        parts = [t + ("(全局)" if inh else "(单独)")
+                 for t, inh, _t in self._row_effective(item, gv)]
+        line = "份数 {} · 色彩 {} · 双面 {} · 页码 {}".format(*parts)
+        extra = []
+        if self.g_paper.currentData():
+            extra.append("纸型 " + self.g_paper.currentText())
+        if self.g_source.currentData():
+            extra.append("进纸 " + self.g_source.currentText())
+        if self.g_per_page.isChecked():
+            extra.append(f"逐页 {self.g_gap.value():g} 秒/页")
+        if extra:
+            line += " · " + " · ".join(extra)
+        return item["path"] + "\n" + line
+
+    def _fill_row(self, r, item, gv=None, seq=None):
+        """按实际生效参数重画一行 (灰色 = 跟随全局, 黑色加粗 = 本文件单独设置)"""
+        gv = gv or self.global_values()
+        seq = (r + 1) if seq is None else seq
+
+        def cell(c):
+            it = self.table.item(r, c)
+            if it is None:
+                it = QTableWidgetItem()
+                self.table.setItem(r, c, it)
+            return it
+
+        for c, text, center in ((C_SEQ, str(seq), True),
+                                (C_NAME, os.path.basename(item["path"]), False),
+                                (C_TYPE, item["type"], False)):
+            it = cell(c)
+            it.setText(text)
+            it.setTextAlignment(Qt.AlignCenter if center
+                                else (Qt.AlignLeft | Qt.AlignVCenter))
+            it.setForeground(QColor("#000000"))
+
+        row_tip = self._row_tip(item, gv)
+        for c, (text, inherited, tip) in zip(
+                (C_COPIES, C_COLOR, C_DUPLEX, C_PAGES), self._row_effective(item, gv)):
+            it = cell(c)
+            it.setText(text)
+            it.setToolTip(tip)
+            it.setTextAlignment(Qt.AlignCenter if c in (C_COPIES, C_PAGES)
+                                else (Qt.AlignLeft | Qt.AlignVCenter))
+            it.setForeground(QColor(INHERIT_FG if inherited else OVERRIDE_FG))
+            f = it.font()
+            f.setBold(not inherited)
+            it.setFont(f)
+
+        cell(C_NAME).setToolTip(row_tip)
+        cell(C_COPIES).setToolTip(row_tip)
+
+        st = cell(C_STATUS)
+        st.setText(item["status"])
+        col = STATUS_COLORS.get(item["status"])
+        st.setForeground(QColor(col) if col else QColor("#000000"))
+
+    def _refresh_effective_now(self):
+        """把全局参数刷到每一行 + 刷新顶部摘要条"""
+        gv = self.global_values()
+        for r, item in enumerate(self.items):
+            self._fill_row(r, item, gv)
+        self._update_eff_label(gv)
+
+    def _on_global_changed(self, *_):
+        """右侧任一全局参数变化时调用 (80ms 节流, 连续调数值也只刷一次)"""
+        if getattr(self, "_eff_timer", None) is None:
+            self._refresh_effective_now()
+        else:
+            self._eff_timer.start()
+
+    def _update_eff_label(self, gv=None):
+        """顶部摘要: 一句话说清现在这些参数到底是多少"""
+        gv = gv or self.global_values()
+        bits = [f"{gv['copies']} 份",
+                COLOR_LABELS.get(gv["color"], "跟随打印机"),
+                DUPLEX_LABELS.get(gv["duplex"], "跟随打印机"),
+                ("页码 " + gv["pages"]) if gv["pages"] else "全部页",
+                "纸型 " + (self.g_paper.currentText()
+                          if self.g_paper.currentData() else "跟随打印机"),
+                "进纸 " + (self.g_source.currentText()
+                          if self.g_source.currentData() else "跟随打印机")]
+        if self.g_per_page.isChecked():
+            bits.append(f"逐页 {self.g_gap.value():g} 秒/页")
+        n_over = sum(1 for it in self.items
+                     if it["copies"] is not None or it["color"] is not None
+                     or it["duplex"] is not None or it["pages"] is not None)
+        if not self.items:
+            tail = "　|　队列为空"
+        elif n_over:
+            tail = f"　|　共 {len(self.items)} 个文件, {n_over} 个有自己的单独设置"
+        else:
+            tail = f"　|　共 {len(self.items)} 个文件, 全部跟随以上参数"
+        self.eff_lbl.setText("✅ 生效参数: " + " · ".join(bits) + tail)
 
     # ------------------------------------------------------------ 添加文件
 
@@ -1104,12 +1297,8 @@ class BatchPrinterApp(QMainWindow):
         self.items.append(item)
         r = self.table.rowCount()
         self.table.insertRow(r)
-        vals = [str(self._seq), os.path.basename(path), cat, "全局", "全局", "全局", "全局", STATUS_QUEUED]
-        for c, v in enumerate(vals):
-            it = QTableWidgetItem(v)
-            if c == C_COPIES or c == C_PAGES:
-                it.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(r, c, it)
+        self._fill_row(r, item, self.global_values())
+        self._update_eff_label()
 
     def _extract_and_enqueue(self, arc_path):
         try:
@@ -1228,28 +1417,12 @@ class BatchPrinterApp(QMainWindow):
     def _rebuild_table(self):
         """按 self.items 重绘整个表格 (行号重排为 1..n)"""
         self.table.setRowCount(0)
+        gv = self.global_values()
         for i, item in enumerate(self.items):
             self.table.insertRow(i)
-            vals = [
-                str(i + 1),
-                os.path.basename(item["path"]),
-                item["type"],
-                "全局" if item["copies"] is None else str(item["copies"]),
-                "全局" if not item["color"] else COLOR_LABELS.get(item["color"], item["color"]),
-                "全局" if not item["duplex"] else DUPLEX_LABELS.get(item["duplex"], item["duplex"]),
-                "全局" if not item["pages"] else item["pages"],
-                item["status"],
-            ]
-            for c, v in enumerate(vals):
-                it = QTableWidgetItem(str(v))
-                if c in (C_COPIES, C_PAGES):
-                    it.setTextAlignment(Qt.AlignCenter)
-                if c == C_STATUS:
-                    col = STATUS_COLORS.get(item["status"])
-                    if col:
-                        it.setForeground(QColor(col))
-                self.table.setItem(i, c, it)
+            self._fill_row(i, item, gv, seq=i + 1)
         self._seq = len(self.items)
+        self._update_eff_label(gv)
 
     def remove_selected(self):
         rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
@@ -1267,6 +1440,7 @@ class BatchPrinterApp(QMainWindow):
         self._seq = 0
         self._added_seq = 0
         self._preview_row = -1
+        self._update_eff_label()
         if hasattr(self, "preview_win"):
             self.preview_win.clear()
 
@@ -1342,10 +1516,12 @@ class BatchPrinterApp(QMainWindow):
             if len(vals) > 1:
                 return "各不相同"
             v = vals.pop()
+            if v is None:
+                return "跟随全局"
             if key == "copies":
-                return default if v is None else f"{v} 份"
+                return f"{v} 份"
             if key == "pages":
-                return default if not v else v
+                return v or default
             return labels.get(v or "", default)
 
         if not single:
@@ -1370,24 +1546,32 @@ class BatchPrinterApp(QMainWindow):
 
         # 色彩
         g.addWidget(QLabel("色彩模式:"), base + 1, 0)
-        color_labels = ["不修改"] + list(COLOR_LABELS.values())
         color_c = QComboBox()
-        color_c.addItems(color_labels)
         if single:
-            color_c.removeItem(0)
-            color_c.setCurrentText(COLOR_LABELS.get(self.items[rows[0]]["color"] or "",
-                                                    "跟随打印机"))
+            # 单文件: 明确区分"跟随全局"(None) 与"跟随打印机"(""),
+            # 否则打开对话框直接点确定会把「跟随全局」悄悄改成「跟随打印机」
+            color_c.addItems(["跟随全局"] + list(COLOR_LABELS.values()))
+            cur_color = self.items[rows[0]]["color"]
+            color_c.setCurrentText("跟随全局" if cur_color is None
+                                   else COLOR_LABELS.get(cur_color, "跟随打印机"))
+        else:
+            color_c.addItems(["不修改"] + list(COLOR_LABELS.values()))
+        color_c.setToolTip("跟随全局 = 用右侧「打印参数」里的色彩设置\n"
+                           "跟随打印机 = 不看全局, 直接交给打印机驱动")
         g.addWidget(color_c, base + 1, 1)
 
         # 双面
         g.addWidget(QLabel("双面/单面:"), base + 2, 0)
-        duplex_labels = ["不修改"] + list(DUPLEX_LABELS.values())
         duplex_c = QComboBox()
-        duplex_c.addItems(duplex_labels)
         if single:
-            duplex_c.removeItem(0)
-            duplex_c.setCurrentText(DUPLEX_LABELS.get(self.items[rows[0]]["duplex"] or "",
-                                                      "跟随打印机"))
+            duplex_c.addItems(["跟随全局"] + list(DUPLEX_LABELS.values()))
+            cur_dup = self.items[rows[0]]["duplex"]
+            duplex_c.setCurrentText("跟随全局" if cur_dup is None
+                                    else DUPLEX_LABELS.get(cur_dup, "跟随打印机"))
+        else:
+            duplex_c.addItems(["不修改"] + list(DUPLEX_LABELS.values()))
+        duplex_c.setToolTip("跟随全局 = 用右侧「打印参数」里的单双面设置\n"
+                            "跟随打印机 = 不看全局, 直接交给打印机驱动")
         g.addWidget(duplex_c, base + 2, 1)
 
         # 页码范围
@@ -1401,7 +1585,9 @@ class BatchPrinterApp(QMainWindow):
         if not single:
             reset_chk = QCheckBox("先清除这些文件已有的单独设置 (全部改为跟随全局)")
             g.addWidget(reset_chk, base + 4, 0, 1, 2)
-        tip = QLabel("留空或选「不修改」= 保持文件原有设置; 选「跟随打印机」= 用打印机默认参数")
+        tip = QLabel("留空或选「不修改」= 保持该文件原有设置\n"
+                     "「跟随全局」= 跟着右侧「打印参数」走\n"
+                     "「跟随打印机」= 不看全局, 直接用驱动默认参数")
         tip.setStyleSheet("color:#888;font-size:11px;")
         tip.setWordWrap(True)
         g.addWidget(tip, base + 5, 0, 1, 2)
@@ -1442,13 +1628,18 @@ class BatchPrinterApp(QMainWindow):
             for r in rows:
                 it = self.items[r]
                 if reset_chk is not None and reset_chk.isChecked():
-                    it.update({"copies": None, "color": "", "duplex": "",
+                    # 全部改回"跟随全局" (None), 而不是"跟随打印机"
+                    it.update({"copies": None, "color": None, "duplex": None,
                                "pages": None})
                 if copies is not None:
                     it["copies"] = copies
-                if color_txt != "不修改":
+                if color_txt == "跟随全局":
+                    it["color"] = None
+                elif color_txt != "不修改":
                     it["color"] = COLOR_LABEL2VAL.get(color_txt, "")
-                if duplex_txt != "不修改":
+                if duplex_txt == "跟随全局":
+                    it["duplex"] = None
+                elif duplex_txt != "不修改":
                     it["duplex"] = DUPLEX_LABEL2VAL.get(duplex_txt, "")
                 if pages_txt:
                     it["pages"] = pages_txt
@@ -1600,11 +1791,17 @@ class BatchPrinterApp(QMainWindow):
                             sig.status.emit(idx, "已取消")
                             continue
                         sig.status.emit(idx, "打印中")
+
+                        def eff(key, _it=item):
+                            """None=跟随全局; 其它(含 "")=本文件单独设置"""
+                            v = _it.get(key)
+                            return g[key] if v is None else v
+
                         opts = {
-                            "copies": item["copies"] if item["copies"] is not None else (g["copies"] or None),
-                            "color": item["color"] or g["color"] or None,
-                            "duplex": item["duplex"] or g["duplex"] or None,
-                            "pages": item["pages"] or g["pages"] or None,
+                            "copies": eff("copies") or None,
+                            "color": eff("color") or None,
+                            "duplex": eff("duplex") or None,
+                            "pages": eff("pages") or None,
                             "layout": layout,
                             "office_com": office_com,
                             "paper": paper,
