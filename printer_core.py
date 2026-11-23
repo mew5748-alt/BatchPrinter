@@ -64,6 +64,11 @@ DMDUP_VERTICAL = 2      # 长边翻页
 DMDUP_HORIZONTAL = 3    # 短边翻页
 DMCOLLATE_TRUE = 1
 
+# 纸张方向: 横图放纵向纸上只能占一半, 改成横向纸就能铺满
+DMORIENT_PORTRAIT = 1
+DMORIENT_LANDSCAPE = 2
+ORIENT_MAP = {"portrait": DMORIENT_PORTRAIT, "landscape": DMORIENT_LANDSCAPE}
+
 # DeviceCapabilities 能力号 (注意 DC_BINS 是 6, 不是 5)
 DC_PAPERS = 2
 DC_PAPERSIZE = 3
@@ -245,7 +250,7 @@ def _paper_size_to_int(v):
 
 
 def _modify_devmode(dm, copies=None, color=None, duplex=None, collate=None,
-                    paper_size=None, paper_source=None):
+                    paper_size=None, paper_source=None, orientation=None):
     """在 PyDEVMODE 上应用设置并置位对应 Fields"""
     fields = 0
     if copies is not None and copies > 0:
@@ -266,6 +271,9 @@ def _modify_devmode(dm, copies=None, color=None, duplex=None, collate=None,
     if paper_source:
         dm.DefaultSource = int(paper_source)
         fields |= DM_DEFAULTSOURCE
+    if orientation:
+        dm.Orientation = int(orientation)
+        fields |= DM_ORIENTATION
     if fields:
         dm.Fields |= fields
     return dm
@@ -395,15 +403,50 @@ class default_printer_guard:
 # ---------------------------------------------------------------- GDI 直印 (文本/图片)
 
 def _open_printer_dc(printer_name, copies=None, color=None, duplex=None,
-                     paper_size=None, paper_source=None):
+                     paper_size=None, paper_source=None, orientation=None):
     hprinter = win32print.OpenPrinter(printer_name)
     dm = win32print.GetPrinter(hprinter, 2)["pDevMode"]
     win32print.ClosePrinter(hprinter)
     _modify_devmode(dm, copies=copies, color=color, duplex=duplex,
                     collate=(copies or 0) > 1,
-                    paper_size=paper_size, paper_source=paper_source)
+                    paper_size=paper_size, paper_source=paper_source,
+                    orientation=orientation)
     hdc = win32gui.CreateDC("WINSPOOL", printer_name, dm)
     return win32ui.CreateDCFromHandle(hdc)
+
+
+def image_orientation(path):
+    """图片本身是横的还是竖的: 'landscape' / 'portrait' (取不到就当竖向)"""
+    try:
+        with Image.open(path) as im:
+            w, h = im.size
+            try:
+                from PIL import ImageOps
+                exif = im.getexif()
+                if exif and int(exif.get(0x0112, 1) or 1) in (5, 6, 7, 8):
+                    w, h = h, w         # 手机竖拍(EXIF 旋转)要先摆正再判断
+            except Exception:
+                pass
+        return "landscape" if w > h else "portrait"
+    except Exception:
+        return "portrait"
+
+
+def resolve_orientation(setting, paths):
+    """'auto' / 'portrait' / 'landscape' -> DEVMODE 方向值 (None = 跟随驱动)
+
+    auto: 看这批图片里第一张的实际朝向 —— 横图就用横向纸, 不然横图挤在竖向 A4 上
+    只能占中间一条, 白白浪费一半纸面。
+    """
+    setting = (setting or "auto").lower()
+    if setting in ORIENT_MAP:
+        return ORIENT_MAP[setting]
+    for p in paths:
+        try:
+            return ORIENT_MAP[image_orientation(p)]
+        except Exception:
+            continue
+    return None
 
 
 def dc_paper_mm(dc):
@@ -477,14 +520,16 @@ class _DocWriter:
 
 
 def print_text_gdi(path, printer_name, copies, color, duplex, page_set, log,
-                   paper_size=None, paper_source=None, per_page=False, page_gap=0.0):
+                   paper_size=None, paper_source=None, per_page=False, page_gap=0.0,
+                   orientation=None):
     """文本文件 GDI 直印, 支持页码范围 / 逐页打印"""
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         lines = f.read().replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
     base = os.path.basename(path)
     dc = _open_printer_dc(printer_name, copies=copies, color=color, duplex=duplex,
-                          paper_size=paper_size, paper_source=paper_source)
+                          paper_size=paper_size, paper_source=paper_source,
+                          orientation=orientation)
     try:
         font = win32ui.CreateFont({"name": "Consolas", "height": -110, "weight": 400})
         dc.SelectObject(font)
@@ -525,7 +570,8 @@ def print_text_gdi(path, printer_name, copies, color, duplex, page_set, log,
 
 
 def print_image_gdi(path, printer_name, copies, color, duplex, page_set, log,
-                    paper_size=None, paper_source=None, per_page=False, page_gap=0.0):
+                    paper_size=None, paper_source=None, per_page=False, page_gap=0.0,
+                    orientation=None):
     """图片 GDI 直印 (等比缩放居中), 多帧 tif/tiff 按页处理"""
     img = Image.open(path)
     frames = []
@@ -547,7 +593,8 @@ def print_image_gdi(path, printer_name, copies, color, duplex, page_set, log,
         return
 
     dc = _open_printer_dc(printer_name, copies=copies, color=color, duplex=duplex,
-                          paper_size=paper_size, paper_source=paper_source)
+                          paper_size=paper_size, paper_source=paper_source,
+                          orientation=orientation)
     try:
         pw, ph = dc.GetDeviceCaps(win32con.HORZRES), dc.GetDeviceCaps(win32con.VERTRES)
         try:
@@ -578,7 +625,8 @@ def print_image_gdi(path, printer_name, copies, color, duplex, page_set, log,
 # ---------------------------------------------------------------- PDF GDI 直印 (pypdfium2 渲染)
 
 def print_pdf_gdi(path, printer_name, copies, color, duplex, page_set, log, dpi=200,
-                  paper_size=None, paper_source=None, per_page=False, page_gap=0.0):
+                  paper_size=None, paper_source=None, per_page=False, page_gap=0.0,
+                  orientation=None):
     """用 pypdfium2 渲染 PDF 后经 GDI 直印, 完整支持份数/色彩/双面/页码/逐页"""
     try:
         import pypdfium2 as pdfium
@@ -598,7 +646,8 @@ def print_pdf_gdi(path, printer_name, copies, color, duplex, page_set, log, dpi=
             return
 
         dc = _open_printer_dc(printer_name, copies=copies, color=color, duplex=duplex,
-                              paper_size=paper_size, paper_source=paper_source)
+                              paper_size=paper_size, paper_source=paper_source,
+                              orientation=orientation)
         try:
             pw, ph = dc.GetDeviceCaps(win32con.HORZRES), dc.GetDeviceCaps(win32con.VERTRES)
             try:
@@ -634,6 +683,339 @@ def print_pdf_gdi(path, printer_name, copies, color, duplex, page_set, log, dpi=
             pass
     log(f"PDF 直印完成 (内置引擎): {base}" + _pages_desc(todo, n))
 
+
+
+# ---------------------------------------------------------------- 多图拼版 (双面)
+
+IMAGE_PER_SIDE_CHOICES = (1, 2, 4)      # 每面可放 1/2/4 张图
+
+DC_DUPLEX = 7                           # DeviceCapabilities: 是否支持双面
+
+
+def printer_supports_duplex(printer_name):
+    """打印机是否支持自动双面: True / False / None(驱动没报, 未知)"""
+    if not printer_name:
+        return None
+    try:
+        v = win32print.DeviceCapabilities(printer_name, printer_port(printer_name), DC_DUPLEX)
+        return int(v or 0) > 0
+    except Exception:
+        return None
+
+
+def image_page_count(path):
+    """一张图片的页数: 多帧 TIFF 的每一帧算一页"""
+    try:
+        with Image.open(path) as im:
+            return max(1, int(getattr(im, "n_frames", 1) or 1))
+    except Exception:
+        return 1
+
+
+def _grid_shape(per_side):
+    """每面张数 -> (列, 行)"""
+    per_side = max(1, int(per_side or 1))
+    if per_side >= 4:
+        return 2, 2
+    if per_side == 3:
+        return 1, 3
+    return 1, per_side
+
+
+def _open_frame(path, index=0):
+    """打开图片第 index 帧, 按 EXIF 方向摆正后转 RGB (手机竖拍的图不会躺倒)"""
+    im = Image.open(path)
+    try:
+        if index:
+            im.seek(index)
+        try:
+            from PIL import ImageOps
+            im = ImageOps.exif_transpose(im)
+        except Exception:
+            pass
+        return im.convert("RGB")
+    finally:
+        try:
+            im.close()
+        except Exception:
+            pass
+
+
+def print_images_merged(paths, printer_name, copies, color, duplex, log,
+                        per_side=1, paper_size=None, paper_source=None,
+                        margin_mm=4.0, gap_mm=3.0, orientation=None):
+    """把多张图片按顺序拼成**一份多页文档**一次发出, 双面打印时正反自动配对.
+
+    为什么需要它: 每个图片文件单独发一个作业时, 每个作业只有一页, 双面设置等于没用
+    ——打印机只会往每张纸的正面打一张图, 背面全空。合并成一个作业后, 页序是
+    图1(正面)、图2(背面)、图3(正面)…, 纸耗直接减半。
+
+    per_side=1: 每页一张图 → 一张纸正反各一张 (最常用)
+    per_side=2/4: 每面再拼 2/4 张 → 一张纸 4/8 张图 (更省纸, 图会缩小)
+
+    返回 (页数, 图片帧数)
+    """
+    frames = []
+    for p in paths:
+        n = image_page_count(p)
+        frames.extend((p, i) for i in range(n))
+    if not frames:
+        return 0, 0
+
+    per_side = max(1, int(per_side or 1))
+    cols, rows = _grid_shape(per_side)
+    pages = [frames[i:i + per_side] for i in range(0, len(frames), per_side)]
+    label = os.path.basename(paths[0]) if len(paths) == 1 else f"{len(paths)} 张图片"
+
+    dc = _open_printer_dc(printer_name, copies=copies, color=color, duplex=duplex,
+                          paper_size=paper_size, paper_source=paper_source,
+                          orientation=orientation)
+    try:
+        dpi = dc.GetDeviceCaps(win32con.LOGPIXELSX) or 600
+        pw, ph = dc.GetDeviceCaps(win32con.HORZRES), dc.GetDeviceCaps(win32con.VERTRES)
+        margin = int(dpi * max(0.0, to_float(margin_mm, 4.0)) / 25.4)
+        gap = int(dpi * max(0.0, to_float(gap_mm, 3.0)) / 25.4)
+        cell_w = max(1, (pw - margin * 2 - gap * (cols - 1)) // cols)
+        cell_h = max(1, (ph - margin * 2 - gap * (rows - 1)) // rows)
+
+        writer = _DocWriter(dc, f"{label} (拼版{per_side}张/面)")
+        try:
+            for k, group in enumerate(pages):
+                writer.begin(k + 1)
+                dc.StartPage()
+                for j, (path, idx) in enumerate(group):
+                    r, c = divmod(j, cols)
+                    x0 = margin + c * (cell_w + gap)
+                    y0 = margin + r * (cell_h + gap)
+                    try:
+                        im = _open_frame(path, idx)
+                    except Exception as e:
+                        log(f"⚠ 跳过 {os.path.basename(path)}: {e}")
+                        continue
+                    try:
+                        dib = ImageWin.Dib(im)
+                        iw, ih = dib.size
+                        if iw <= 0 or ih <= 0:
+                            continue
+                        s = min(cell_w / float(iw), cell_h / float(ih))
+                        w, h = max(1, int(iw * s)), max(1, int(ih * s))
+                        dx = x0 + (cell_w - w) // 2
+                        dy = y0 + (cell_h - h) // 2
+                        dib.draw(dc.GetHandleOutput(), (dx, dy, dx + w, dy + h))
+                    finally:
+                        im.close()
+                writer.end(last=(k == len(pages) - 1))
+        finally:
+            writer.close()
+    finally:
+        dc.DeleteDC()
+
+    duplex_txt = ""
+    if duplex == DMDUP_VERTICAL:
+        duplex_txt = " · 双面(长边)"
+    elif duplex == DMDUP_HORIZONTAL:
+        duplex_txt = " · 双面(短边)"
+    sheets = (len(pages) + 1) // 2 if duplex_txt else len(pages)
+    log(f"多图拼版打印完成: {len(frames)} 张图 → {len(pages)} 页"
+        f"(每面 {per_side} 张){duplex_txt} ≈ {sheets} 张纸")
+    return len(pages), len(frames)
+
+
+# ---------------------------------------------------------------- 连续打印 (跨文件接续)
+
+CONT_CATS = (CAT_IMAGE, CAT_PDF, CAT_OFFICE, CAT_TEXT)   # 能接续成一个作业的格式
+
+
+def _text_font(size):
+    """等宽字体 (与 GDI 文本打印观感一致), 都找不到就用默认位图字体"""
+    from PIL import ImageFont
+    for name in ("consola.ttf", "cour.ttf", "msyh.ttc", "simsun.ttc"):
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+
+def _render_text_pages(path, pw, ph, page_set, dpi, log):
+    """把文本文件排成整页图像, 逐页 yield"""
+    from PIL import ImageDraw
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except Exception as e:
+        log(f"⚠ 跳过 {os.path.basename(path)}: {e}")
+        return
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    size = max(10, int(dpi * 10 / 72.0))          # 10pt
+    font = _text_font(size)
+    lh = max(1, int(size * 1.35))
+    margin = max(10, int(dpi * 3.5 / 25.4))       # 3.5mm
+    per = max(1, (ph - margin * 2) // lh)
+    total = max(1, (len(lines) + per - 1) // per)
+    for pno in plan_pages(total, page_set):
+        img = Image.new("RGB", (pw, ph), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        y = margin
+        for line in lines[(pno - 1) * per: pno * per]:
+            if font is not None:
+                draw.text((margin, y), line[:220], fill=(0, 0, 0), font=font)
+            y += lh
+        yield img
+
+
+def _iter_job_pages(job, pw, ph, dpi, log):
+    """一个文件 -> 逐页的 PIL 图像 (失败只跳过这一个文件, 不影响整批)"""
+    cat = job.get("cat")
+    path = job.get("path")
+    page_set = job.get("pages")
+    name = os.path.basename(path)
+
+    if cat == CAT_IMAGE:
+        n = image_page_count(path)
+        for i in plan_pages(n, page_set):
+            try:
+                yield _open_frame(path, i - 1)
+            except Exception as e:
+                log(f"⚠ 跳过 {name} 第{i}页: {e}")
+        return
+
+    if cat == CAT_TEXT:
+        for img in _render_text_pages(path, pw, ph, page_set, dpi, log):
+            yield img
+        return
+
+    # PDF / Office: 拿一个 PDF 再逐页渲染
+    work = None
+    try:
+        if cat == CAT_OFFICE:
+            pdf_path, work = office_core.export_pdf(
+                path, job.get("layout"), log, kind=office_core.ext_kind(os.path.splitext(path)[1]))
+        else:
+            pdf_path = path
+        try:
+            import pypdfium2 as pdfium
+        except ImportError:
+            log(f"⚠ 跳过 {name}: 没有 PDF 渲染引擎 (pypdfium2)")
+            return
+        try:
+            pdf = pdfium.PdfDocument(pdf_path)
+        except Exception as e:
+            log(f"⚠ 跳过 {name}: PDF 打开失败 ({e})")
+            return
+        try:
+            n = len(pdf)
+            for pno in plan_pages(n, page_set):
+                try:
+                    page = pdf[pno - 1]
+                    yield page.render(scale=dpi / 72.0).to_pil().convert("RGB")
+                    page.close()
+                except Exception as e:
+                    log(f"⚠ {name} 第{pno}页渲染失败: {e}")
+        finally:
+            try:
+                pdf.close()
+            except Exception:
+                pass
+    finally:
+        if work:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def print_files_continuous(jobs, printer_name, copies, color, duplex, log,
+                           per_side=1, paper_size=None, paper_source=None,
+                           dpi=200, margin_mm=4.0, gap_mm=3.0, orientation=None):
+    """把多个文件的所有页**接续成同一个打印作业**发出.
+
+    为什么: 每个文件单独成作业时, 打印机总是从新纸的正面开始 —— 前一个文件页数为奇数
+    时, 最后那张纸的背面就空着, 下一个文件又从新纸开始, 中间白白浪费一个面。
+    接续成一个作业后, 页码连续排下去, 双面自动正反配对, 文件之间不留空面。
+    (注意: 页数总量为奇数时, 最后一张纸的背面仍然会是空的, 这是物理必然)
+
+    jobs: [{"path", "cat", "pages"(set|None), "layout"(dict|None)}, ...]
+    返回 (总页数, 成功输出的文件数)
+    """
+    if not jobs:
+        return 0, 0
+
+    per_side = max(1, int(per_side or 1))
+    cols, rows = _grid_shape(per_side)
+    dc = _open_printer_dc(printer_name, copies=copies, color=color, duplex=duplex,
+                          paper_size=paper_size, paper_source=paper_source,
+                          orientation=orientation)
+    pages_total = 0
+    files_done = 0
+    try:
+        dpi_dc = dc.GetDeviceCaps(win32con.LOGPIXELSX) or dpi
+        pw, ph = dc.GetDeviceCaps(win32con.HORZRES), dc.GetDeviceCaps(win32con.VERTRES)
+        margin = int(dpi_dc * max(0.0, to_float(margin_mm, 4.0)) / 25.4)
+        gap = int(dpi_dc * max(0.0, to_float(gap_mm, 3.0)) / 25.4)
+        cell_w = max(1, (pw - margin * 2 - gap * (cols - 1)) // cols)
+        cell_h = max(1, (ph - margin * 2 - gap * (rows - 1)) // rows)
+
+        # 文本页按"渲染 dpi"生成 (直接用打印机 600dpi 像素开会是近百 MB 一张图)
+        pw_mm = pw * 25.4 / max(1, dpi_dc)
+        ph_mm = ph * 25.4 / max(1, dpi_dc)
+        render_w = max(1, int(pw_mm * dpi / 25.4))
+        render_h = max(1, int(ph_mm * dpi / 25.4))
+
+        writer = _DocWriter(dc, "连续打印")
+        bucket = []          # 当前这一面待放的图
+
+        def flush_side():
+            nonlocal pages_total
+            if not bucket:
+                return
+            writer.begin(pages_total + 1)
+            dc.StartPage()
+            for j, im in enumerate(bucket):
+                try:
+                    r, c = divmod(j, cols)
+                    x0 = margin + c * (cell_w + gap)
+                    y0 = margin + r * (cell_h + gap)
+                    dib = ImageWin.Dib(im)
+                    iw, ih = dib.size
+                    if iw <= 0 or ih <= 0:
+                        continue
+                    s = min(cell_w / float(iw), cell_h / float(ih))
+                    w, h = max(1, int(iw * s)), max(1, int(ih * s))
+                    dx = x0 + (cell_w - w) // 2
+                    dy = y0 + (cell_h - h) // 2
+                    dib.draw(dc.GetHandleOutput(), (dx, dy, dx + w, dy + h))
+                finally:
+                    try:
+                        im.close()
+                    except Exception:
+                        pass
+            writer.end()
+            pages_total += 1
+            bucket.clear()
+
+        for job in jobs:
+            got = 0
+            try:
+                for im in _iter_job_pages(job, render_w, render_h, dpi, log):
+                    bucket.append(im)
+                    got += 1
+                    if len(bucket) >= per_side:
+                        flush_side()
+            except Exception as e:
+                log(f"⚠ {os.path.basename(job.get('path', ''))}: {e}")
+            if got:
+                files_done += 1
+        flush_side()
+        writer.close()
+    finally:
+        dc.DeleteDC()
+
+    duplex_txt = {DMDUP_VERTICAL: "双面(长边)", DMDUP_HORIZONTAL: "双面(短边)"}.get(duplex, "")
+    sheets = (pages_total + 1) // 2 if duplex_txt else pages_total
+    log(f"连续打印: {files_done} 个文件接续成 {pages_total} 页"
+        + (f" · {duplex_txt} ≈ {sheets} 张纸" if duplex_txt else f" ≈ {sheets} 张纸"))
+    return pages_total, files_done
 
 
 # ---------------------------------------------------------------- RAW 直写
@@ -863,7 +1245,8 @@ def print_file(path, printer_name, opts, ext_map, sumatra_exe, log):
         fn = print_text_gdi if cat == CAT_TEXT else print_image_gdi
         fn(path, printer_name, copies, color, duplex, page_set, log,
            paper_size=paper_size, paper_source=paper_source,
-           per_page=per_page, page_gap=page_gap)
+           per_page=per_page, page_gap=page_gap,
+           orientation=(opts.get("orientation") if cat == CAT_IMAGE else None))
     else:
         done = False
         if opts.get("office_com", True):

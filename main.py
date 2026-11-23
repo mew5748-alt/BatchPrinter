@@ -37,6 +37,10 @@ from printer_core import (
     resolve_category, all_known_exts, parse_page_range,
     default_printer_guard, get_default_printer_name,
     list_paper_sizes, list_paper_bins,
+    print_images_merged, printer_supports_duplex, image_page_count,
+    print_files_continuous, CONT_CATS,
+    settings_to_devmode_values, CAT_IMAGE, CAT_OFFICE,
+    resolve_orientation, image_orientation, ORIENT_MAP,
 )
 from archive_util import extract_archive, cleanup_dir, is_archive
 
@@ -44,7 +48,7 @@ APP_NAME = "BatchPrinter"
 PREVIEW_MIN_W = 240          # 预览列最窄
 PREVIEW_DEFAULT_W = 330      # 默认宽度
 PREVIEW_MAX_W = 620          # 最宽
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.4"
 
 APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
@@ -93,6 +97,14 @@ DEFAULT_CONFIG = {
     "printer": "",
     "global": {"copies": 1, "color": "", "duplex": "", "pages": "",
                "paper": 0, "source": 0, "per_page": False, "page_gap": 0.5},
+    # 多图拼版: 连续的图片合成一份文档, 双面打印时两个文件正好正反配对.
+    # 默认关闭, 需要时在「打印参数」里勾选; 勾选状态会被记住 (放顶层, 不随启动重置)
+    "img_merge": False,
+    "img_side": 1,
+    # 连续打印: 整批文件接续成一个作业, 文件之间不留空面
+    "continuous": False,
+    # 图片纸张方向: auto(按图片宽高) / portrait / landscape
+    "orient": "auto",
     "layout": dict(DEFAULT_LAYOUT_CFG),
     "office_com": True,
     "subfolders": True,
@@ -102,6 +114,9 @@ DEFAULT_CONFIG = {
     "preview_show": True,       # 主界面里是否显示预览面板
     "preview_width": 330,       # 预览面板宽度 (像素)
 }
+
+IMG_ORIENT_LABELS = {"auto": "自动 (横图用横向纸)", "portrait": "纵向", "landscape": "横向"}
+IMG_ORIENT_LABEL2VAL = {v: k for k, v in IMG_ORIENT_LABELS.items()}
 
 COLOR_LABELS = {"": "跟随打印机", "color": "彩色", "mono": "黑白"}
 DUPLEX_LABELS = {"": "跟随打印机", "simplex": "单面",
@@ -366,6 +381,7 @@ class BatchPrinterApp(QMainWindow):
 
         self.cfg = load_config()
         self.items = []
+        self._bulk_depth = 0          # >0 表示正在批量添加文件 (冻结表格刷新)
         self.temp_roots = set()
         self._seq = 0
         self._added_seq = 0
@@ -383,6 +399,12 @@ class BatchPrinterApp(QMainWindow):
         self._eff_timer.setSingleShot(True)
         self._eff_timer.setInterval(80)
         self._eff_timer.timeout.connect(self._refresh_effective_now)
+
+        # 批量添加的收尾定时器: 0ms 触发, 同一轮事件循环内的多次添加只刷新一次
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setSingleShot(True)
+        self._flush_timer.setInterval(0)
+        self._flush_timer.timeout.connect(self._flush_bulk)
 
         self._build_ui()
         self._init_paper_ui()
@@ -604,6 +626,57 @@ class BatchPrinterApp(QMainWindow):
         self.g_gap.setToolTip("逐页打印时, 每页之间等待多久再发下一页\n"
                               "0 = 不等待 (连续发); 手动翻纸时可设 3~5 秒")
         g.addWidget(self.g_gap, 6, 1)
+
+        # 多图拼版: 把连续的图片合成一份文档一次发出, 双面才真正生效
+        # 连续打印: 整批文件接续成一个作业, 前一个文件页数为奇数也不会空出一个面
+        self.g_cont = QCheckBox("🔗 连续打印 (文件不留空面)")
+        self.g_cont.setToolTip(
+            "把整批文件按顺序接续成**一个打印作业**: 上一个文件的最后一页后面紧接下一个文件的首页。\n\n"
+            "解决什么: 每个文件单独成作业时, 打印机总是从新纸的正面开始 —— 前一个文件\n"
+            "页数是奇数(如 1 张图片、3 页文档)时, 那张纸的背面就空着, 下一个文件又从新纸开始,\n"
+            "中间白白浪费一整个面。接续后页码连续排下去, 双面自动正反配对。\n\n"
+            "支持: 图片 / PDF / Word·Excel·PPT / 文本。prn·ps·pcl 无法接续, 仍单独发送。\n"
+            "与「多图拼成一份双面文档」互斥: 勾这个会自动取消那个 (连续打印是它的超集)。")
+        self.g_cont.toggled.connect(self._sync_img_merge)
+        g.addWidget(self.g_cont, 7, 0, 1, 2)
+
+        self.g_img_merge = QCheckBox("🖼 多图拼成一份双面文档")
+        self.g_img_merge.setToolTip(
+            "把列表里连续的图片按顺序合成**一份多页文档**再发送。\n"
+            "双面打印时: 第1张印在纸张正面、第2张印在背面、第3张下一张纸正面…\n\n"
+            "不勾选时每张图片都是独立作业(只有一页), 双面设置实际不生效,\n"
+            "结果是每张照片都独占一张纸、背面全空。\n\n"
+            "只合并图片; 想让 PDF/Word 也接着填满空面, 用上面的「连续打印」。\n"
+            "勾选后会自动关闭「逐页打印」(逐页会把文档又拆回单页作业)")
+        self.g_img_merge.toggled.connect(self._sync_img_merge)
+        g.addWidget(self.g_img_merge, 8, 0, 1, 2)
+
+        g.addWidget(QLabel("每面图片:"), 9, 0)
+        self.g_img_side = QComboBox()
+        self.g_img_side.addItems(["1 张 (正反各一张)",
+                                  "2 张 (一纸 4 张)",
+                                  "4 张 (一纸 8 张)"])
+        self.g_img_side.setToolTip(
+            "每面 1 张: 一张纸正反各一张图 (最常用, 不缩小)\n"
+            "每面 2 张: 一张纸 4 张图 (上下排布, 每张缩到半页)\n"
+            "每面 4 张: 一张纸 8 张图 (2×2 排布, 适合小图/缩略图)\n"
+            "连续打印时, 只有整段都是图片才会按这个张数拼; 混了 PDF/文档则每面 1 页")
+        g.addWidget(self.g_img_side, 9, 1)
+
+        # 图片纸张方向: 横向图默认挤在竖向纸中间一条, 改成横向纸就能铺满
+        g.addWidget(QLabel("图片方向:"), 10, 0)
+        self.g_orient = QComboBox()
+        self.g_orient.addItems(list(IMG_ORIENT_LABELS.values()))
+        self.g_orient.setCurrentText(
+            IMG_ORIENT_LABELS.get(self.cfg.get("orient", "auto"), "自动 (横图用横向纸)"))
+        self.g_orient.setToolTip(
+            "打印机默认纵向出纸: 横向拍的照片放上去只能占中间窄窄一条, 小得看不清。\n\n"
+            "自动 (推荐): 横图自动改用横向纸铺满, 竖图用纵向纸\n"
+            "纵向: 一律按纵向出纸\n"
+            "横向: 一律按横向出纸\n\n"
+            "注意: 一个打印作业内纸张方向是固定的, 所以「自动」遇到横竖混排时,\n"
+            "会在方向变化处把作业分成几段分别发送 (每段内部仍然连续)")
+        g.addWidget(self.g_orient, 10, 1)
         rv_inner.addWidget(g1)
 
         # ---- 版面设置 (只影响打印, 不改原文件)
@@ -716,6 +789,10 @@ class BatchPrinterApp(QMainWindow):
             "per_page": self.g_per_page.isChecked(),
             "page_gap": round(float(self.g_gap.value()), 2),
         }
+        self.cfg["img_merge"] = self.g_img_merge.isChecked()
+        self.cfg["img_side"] = self.img_side_value()
+        self.cfg["continuous"] = self.g_cont.isChecked()
+        self.cfg["orient"] = IMG_ORIENT_LABEL2VAL.get(self.g_orient.currentText(), "auto")
         self.cfg["subfolders"] = self.subfolder_chk.isChecked()
         self.cfg["layout"] = dict(self.cfg.get("layout") or DEFAULT_LAYOUT_CFG)
         try:
@@ -997,6 +1074,11 @@ class BatchPrinterApp(QMainWindow):
         g = self.cfg["global"]
         self.g_per_page.setChecked(bool(g.get("per_page", False)))
         self.g_gap.setValue(max(0.0, float(g.get("page_gap") or 0.0)))
+        # 多图拼版 / 连续打印 (默认都关闭, 手动勾选; 勾选状态会被记住)
+        self.g_img_side.setCurrentIndex({1: 0, 2: 1, 4: 2}.get(int(self.cfg.get("img_side") or 1), 0))
+        self.g_img_merge.setChecked(bool(self.cfg.get("img_merge", False)))
+        self.g_cont.setChecked(bool(self.cfg.get("continuous", False)))
+        self._sync_img_merge()
         self.g_per_page.toggled.connect(self._sync_per_page)
         self.printer_combo.currentTextChanged.connect(self._on_printer_changed)
         # 任何一个全局参数变了 -> 摘要条 + 各行显示立刻跟着变
@@ -1007,12 +1089,34 @@ class BatchPrinterApp(QMainWindow):
                        (self.g_paper, "currentTextChanged"),
                        (self.g_source, "currentTextChanged"),
                        (self.g_per_page, "toggled"),
-                       (self.g_gap, "valueChanged")):
+                       (self.g_gap, "valueChanged"),
+                       (self.g_orient, "currentTextChanged")):
             getattr(w, sig).connect(self._on_global_changed)
         self._sync_per_page()
 
     def _sync_per_page(self, *_):
         self.g_gap.setEnabled(self.g_per_page.isChecked())
+
+    def _sync_img_merge(self, *_):
+        """连续打印 / 多图拼版: 互斥 (连续打印是超集), 且都要关掉「逐页打印」——
+        逐页会按页拆成单页作业, 双面就又失效了"""
+        src = self.sender()
+        cont = self.g_cont.isChecked()
+        merge = self.g_img_merge.isChecked()
+        if cont and merge and src is not None:
+            other = self.g_img_merge if src is self.g_cont else self.g_cont
+            other.blockSignals(True)
+            other.setChecked(False)
+            other.blockSignals(False)
+            cont = self.g_cont.isChecked()
+            merge = self.g_img_merge.isChecked()
+        self.g_img_side.setEnabled(cont or merge)
+        if (cont or merge) and self.g_per_page.isChecked():
+            self.g_per_page.setChecked(False)
+
+    def img_side_value(self):
+        """每面图片张数 1/2/4"""
+        return (1, 2, 4)[max(0, min(2, self.g_img_side.currentIndex()))]
 
     def _printer_caps(self):
         """当前打印机支持的 (纸型列表, 纸盒列表), 按打印机缓存 (枚举一次要几十毫秒)"""
@@ -1223,6 +1327,12 @@ class BatchPrinterApp(QMainWindow):
                           if self.g_source.currentData() else "跟随打印机")]
         if self.g_per_page.isChecked():
             bits.append(f"逐页 {self.g_gap.value():g} 秒/页")
+        if self.g_orient.currentText() != IMG_ORIENT_LABELS["auto"]:
+            bits.append("图片" + self.g_orient.currentText())
+        if self.g_cont.isChecked():
+            bits.append("连续打印")
+        elif self.g_img_merge.isChecked():
+            bits.append(f"图片拼版 {self.img_side_value()}张/面")
         n_over = sum(1 for it in self.items
                      if it["copies"] is not None or it["color"] is not None
                      or it["duplex"] is not None or it["pages"] is not None)
@@ -1260,6 +1370,15 @@ class BatchPrinterApp(QMainWindow):
             self.enqueue_path(p, recursive=False)
 
     def enqueue_path(self, path, recursive=True):
+        """加入队列. 批量模式靠 0ms 定时器收尾: 同一轮事件循环里拖入几百个文件,
+        只会在最后统一刷新一次表格 (中途不重绘、不重算列宽)。"""
+        self._bulk_enter()
+        try:
+            self._enqueue_path(path, recursive)
+        finally:
+            self._flush_timer.start(0)      # 重复 start 只保留一次触发
+
+    def _enqueue_path(self, path, recursive=True):
         ext_map = self._ext_map()
         known = all_known_exts(ext_map)
         if os.path.isdir(path):
@@ -1298,7 +1417,47 @@ class BatchPrinterApp(QMainWindow):
         r = self.table.rowCount()
         self.table.insertRow(r)
         self._fill_row(r, item, self.global_values())
+        # 批量添加时不要每加一行就重算摘要/列宽 (几百个文件会 O(n²) 卡住界面)
+        if not self._bulk_depth:
+            self._update_eff_label()
+
+    # ------------------------------------------------------------ 批量添加 (防卡顿)
+
+    def _begin_bulk(self):
+        """批量添加期间冻结表格重绘, 并把列宽改成固定 (ResizeToContents 每插一行都要
+        重新测量所有行, 几百个文件时会卡住好几秒)"""
+        self.table.setUpdatesEnabled(False)
+        hh = self.table.horizontalHeader()
+        for c in range(self.table.columnCount()):
+            hh.setSectionResizeMode(c, QHeaderView.Interactive)
+
+    def _end_bulk(self):
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(C_NAME, QHeaderView.Stretch)
+        for c in (C_STATUS, C_COPIES, C_TYPE, C_SEQ):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.table.resizeColumnsToContents()      # 一次性测量, 不再逐行
+        self.table.setUpdatesEnabled(True)
+        self.table.viewport().update()
         self._update_eff_label()
+        if self.items:
+            self.table.scrollToBottom()
+
+    def _bulk_enter(self):
+        self._bulk_depth += 1
+        if self._bulk_depth == 1:
+            self._begin_bulk()
+
+    def _bulk_leave(self):
+        self._bulk_depth = max(0, self._bulk_depth - 1)
+        if self._bulk_depth == 0:
+            self._end_bulk()
+
+    def _flush_bulk(self):
+        """定时器回调: 这一轮添加结束了, 一次性收尾"""
+        if self._bulk_depth:
+            self._bulk_depth = 0
+            self._end_bulk()
 
     def _extract_and_enqueue(self, arc_path):
         try:
@@ -1779,6 +1938,96 @@ class BatchPrinterApp(QMainWindow):
         if office_com:
             self._log("Office 文件使用静默打印 (COM 转 PDF 后发送, 不会弹出程序窗口)")
 
+        cont = bool(self.g_cont.isChecked())
+        img_merge = bool(self.g_img_merge.isChecked()) and not cont
+        img_side = self.img_side_value()
+        if cont or img_merge:
+            if cont:
+                self._log("连续打印: 整批文件接续成一个作业 (上一个文件的末页后面紧接下一个文件), "
+                          "双面时文件之间不留空面")
+            else:
+                self._log(f"多图拼版: 连续的图片合成一份文档, 每面 {img_side} 张 "
+                          f"→ 双面时正反自动配对")
+            g_dup = (g.get("duplex") or "")
+            if printer_supports_duplex(printer) is False:
+                self._log("⚠ 打印机驱动报告不支持自动双面, 双面设置可能无效 (会按单面出纸)")
+            if g_dup == "simplex":
+                self._log("⚠ 当前是「单面」: 接续后每页各占一张纸, 选「双面(长边)」才能正反配对省纸")
+            elif not g_dup:
+                self._log("提示: 双面跟随打印机默认值; 若不是双面, 每页会各占一张纸")
+
+        # 分组: 连续打印 -> 可接续格式连成一段; 图片拼版 -> 连续图片成一段; 其它各自一组
+        def _cat_of(path):
+            e = os.path.splitext(path)[1].lower().lstrip(".")
+            return resolve_category(ext_map.get(e, e), ext_map)
+
+        groups = []
+        if cont:
+            cur = []
+            for i, it in enumerate(items_snapshot):
+                if _cat_of(it["path"]) in CONT_CATS:
+                    cur.append(i)
+                else:
+                    if cur:
+                        groups.append(("cont", cur))
+                        cur = []
+                    groups.append(("file", [i]))
+            if cur:
+                groups.append(("cont", cur))
+        elif img_merge:
+            cur = []
+            for i, it in enumerate(items_snapshot):
+                if _cat_of(it["path"]) == CAT_IMAGE:
+                    cur.append(i)
+                else:
+                    if cur:
+                        groups.append(("images", cur))
+                        cur = []
+                    groups.append(("file", [i]))
+            if cur:
+                groups.append(("images", cur))
+        else:
+            groups = [("file", [i]) for i in range(len(items_snapshot))]
+
+        # 图片方向: 横图默认挤在竖向纸中间一条, 改成横向纸才铺满.
+        # 一个作业内纸张方向固定, 所以「自动」遇到横竖混排时按方向切成几段分别发
+        orient_setting = IMG_ORIENT_LABEL2VAL.get(self.g_orient.currentText(), "auto")
+
+        def _orient_of(idxs):
+            return resolve_orientation(
+                orient_setting,
+                [items_snapshot[i]["path"] for i in idxs
+                 if _cat_of(items_snapshot[i]["path"]) == CAT_IMAGE])
+
+        def _split_orient(idxs):
+            segs, cur, key = [], [], None
+            for i in idxs:
+                k = (image_orientation(items_snapshot[i]["path"])
+                     if _cat_of(items_snapshot[i]["path"]) == CAT_IMAGE else "")
+                if not k:                 # 非图片 (PDF/文档) 跟随当前段的方向
+                    cur.append(i)
+                    continue
+                if key is None or k == key:
+                    key = k
+                    cur.append(i)
+                else:
+                    if cur:
+                        segs.append(cur)
+                    cur, key = [i], k
+            if cur:
+                segs.append(cur)
+            return segs
+
+        if orient_setting == "auto":
+            expanded = []
+            for kind, idxs in groups:
+                if kind in ("cont", "images"):
+                    for seg in _split_orient(idxs):
+                        expanded.append((kind, seg))
+                else:
+                    expanded.append((kind, idxs))
+            groups = expanded
+
         def work():
             sig = self.sig
             # 整批打印期间把系统默认打印机切到所选打印机, 结束后恢复。
@@ -1786,13 +2035,18 @@ class BatchPrinterApp(QMainWindow):
             guard_log = lambda m: sig.log.emit(m)  # noqa: E731
             try:
                 with default_printer_guard(printer, guard_log):
-                    for idx, item in enumerate(items_snapshot):
+                    for kind, idxs in groups:
                         if self.cancel_event.is_set():
-                            sig.status.emit(idx, "已取消")
+                            for i in idxs:
+                                sig.status.emit(i, "已取消")
                             continue
-                        sig.status.emit(idx, "打印中")
+                        for i in idxs:
+                            sig.status.emit(i, "打印中")
 
-                        def eff(key, _it=item):
+                        first = items_snapshot[idxs[0]]
+                        orient = _orient_of(idxs)      # 该段的纸张方向 (None = 跟随驱动)
+
+                        def eff(key, _it=first):
                             """None=跟随全局; 其它(含 "")=本文件单独设置"""
                             v = _it.get(key)
                             return g[key] if v is None else v
@@ -1806,15 +2060,80 @@ class BatchPrinterApp(QMainWindow):
                             "office_com": office_com,
                             "paper": paper,
                             "source": source,
+                            "orientation": orient,
                         }
                         opts.update(extras)
-                        try:
-                            print_file(item["path"], printer, opts, ext_map, sumatra,
-                                       lambda m: sig.log.emit("  " + m))
-                            sig.status.emit(idx, "已发送")
-                        except Exception as e:
-                            sig.log.emit(f"❌ {os.path.basename(item['path'])}: {e}")
-                            sig.status.emit(idx, "失败")
+
+                        if kind == "cont":
+                            # 整段接续成一个作业: 页码按每个文件自己的设置过滤, 份数/色彩/双面统一
+                            opts["per_page"] = False
+                            opts["page_gap"] = 0.0
+                            c, col, dup = settings_to_devmode_values(
+                                opts.get("copies"), opts.get("color"), opts.get("duplex"))
+                            jobs = []
+                            for i in idxs:
+                                it = items_snapshot[i]
+                                pv = g["pages"] if it.get("pages") is None else it.get("pages")
+                                jobs.append({"path": it["path"], "cat": _cat_of(it["path"]),
+                                             "pages": parse_page_range(pv), "layout": layout})
+                            seg_side = img_side if all(j["cat"] == CAT_IMAGE for j in jobs) else 1
+                            # 段里有 Office 文档就按 300dpi 渲染 (文字更清晰), 纯图片/PDF 用 200
+                            seg_dpi = 300 if any(j["cat"] == CAT_OFFICE for j in jobs) else 200
+                            if len(idxs) > 1 and any(
+                                    items_snapshot[i].get(k) is not None
+                                    for i in idxs for k in ("copies", "color", "duplex")):
+                                sig.log.emit("  提示: 连续打印整段统一用第一个文件的份数/色彩/双面")
+                            try:
+                                print_files_continuous(
+                                    jobs, printer, c, col, dup,
+                                    lambda m: sig.log.emit("  " + m),
+                                    per_side=seg_side,
+                                    paper_size=paper or None,
+                                    paper_source=source or None,
+                                    dpi=seg_dpi,
+                                    orientation=orient)
+                                for i in idxs:
+                                    sig.status.emit(i, "已发送")
+                            except Exception as e:
+                                names = "、".join(os.path.basename(items_snapshot[i]["path"])
+                                                 for i in idxs[:3])
+                                sig.log.emit(f"❌ 连续打印失败 ({names}"
+                                             + ("…" if len(idxs) > 3 else "") + f"): {e}")
+                                for i in idxs:
+                                    sig.status.emit(i, "失败")
+                        elif kind == "images":
+                            # 拼版: 页码/逐页都不适用 (拼版本身就是按顺序排页)
+                            opts["per_page"] = False
+                            opts["page_gap"] = 0.0
+                            c, col, dup = settings_to_devmode_values(
+                                opts.get("copies"), opts.get("color"), opts.get("duplex"))
+                            try:
+                                print_images_merged(
+                                    [items_snapshot[i]["path"] for i in idxs],
+                                    printer, c, col, dup,
+                                    lambda m: sig.log.emit("  " + m),
+                                    per_side=img_side,
+                                    paper_size=paper or None,
+                                    paper_source=source or None,
+                                    orientation=orient)
+                                for i in idxs:
+                                    sig.status.emit(i, "已发送")
+                            except Exception as e:
+                                names = "、".join(os.path.basename(items_snapshot[i]["path"])
+                                                 for i in idxs[:3])
+                                sig.log.emit(f"❌ 拼版打印失败 ({names}"
+                                             + ("…" if len(idxs) > 3 else "") + f"): {e}")
+                                for i in idxs:
+                                    sig.status.emit(i, "失败")
+                        else:
+                            try:
+                                print_file(first["path"], printer, opts, ext_map, sumatra,
+                                           lambda m: sig.log.emit("  " + m))
+                                sig.status.emit(idxs[0], "已发送")
+                            except Exception as e:
+                                sig.log.emit(f"❌ {os.path.basename(first['path'])}: {e}")
+                                sig.status.emit(idxs[0], "失败")
+
                         if interval > 0:
                             self.cancel_event.wait(interval)
             finally:
